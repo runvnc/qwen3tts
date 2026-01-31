@@ -15,6 +15,10 @@ from typing import Any, Dict, Optional
 import numpy as np
 import torch
 import websockets
+
+# Enable TensorFloat32 for better performance on Ampere+ GPUs (~15% speedup)
+torch.set_float32_matmul_precision('high')
+
 from websockets.server import WebSocketServerProtocol
 
 # Local imports
