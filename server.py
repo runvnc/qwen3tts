@@ -134,8 +134,8 @@ def float32_to_ulaw(audio: np.ndarray, sample_rate: int = 24000, target_rate: in
 
 
     # Convert to ulaw using numpy (avoids deprecated audioop)
-    ulaw_bytes = _pcm16_to_ulaw_numpy(pcm16)
-    return ulaw_bytes.astype(np.uint8).tobytes()
+    # _pcm16_to_ulaw_numpy already returns bytes
+    return _pcm16_to_ulaw_numpy(pcm16)
 
 
 def _pcm16_to_ulaw_numpy(pcm16: np.ndarray) -> bytes:
