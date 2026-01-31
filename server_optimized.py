@@ -138,7 +138,7 @@ class Qwen3TTSServer:
             self.model.enable_streaming_optimizations(
                 decode_window_frames=DEFAULT_DECODE_WINDOW,
                 use_compile=True,
-                use_cuda_graphs=False,  # Can cause issues
+                use_cuda_graphs=True,  # Enable for better TTFT
                 compile_mode="reduce-overhead",
                 use_fast_codebook=False,  # Disabled in fork too
                 compile_codebook_predictor=True,
