@@ -132,7 +132,7 @@ def float32_to_ulaw(audio: np.ndarray, sample_rate: int = 24000, target_rate: in
     pcm16 = (audio * 32767).astype(np.int16)
     pcm_bytes = pcm16.tobytes()
 
-    
+
     # Convert to ulaw using numpy (avoids deprecated audioop)
     ulaw_bytes = _pcm16_to_ulaw_numpy(pcm16)
     return ulaw_bytes.astype(np.uint8).tobytes()
@@ -143,17 +143,17 @@ def _pcm16_to_ulaw_numpy(pcm16: np.ndarray) -> bytes:
     # u-law compression constants
     BIAS = 0x84
     CLIP = 32635
-    
+
     # Work with absolute values, track sign
     sign = (pcm16 < 0).astype(np.uint8) * 0x80
     pcm16 = np.abs(pcm16).clip(0, CLIP)
     pcm16 = pcm16 + BIAS
-    
+
     # Compute exponent and mantissa
     exponent = np.floor(np.log2(pcm16)).astype(np.uint8) - 7
     exponent = np.clip(exponent, 0, 7)
     mantissa = (pcm16 >> (exponent + 3)) & 0x0F
-    
+
     # Combine into u-law byte
     ulaw_bytes = ~(sign | (exponent << 4) | mantissa) & 0xFF
     return ulaw_bytes.astype(np.uint8).tobytes()
@@ -381,10 +381,12 @@ class Qwen3TTSServer:
 
             # Compute voice_id from audio hash BEFORE decoding (fast check)
             # This allows us to skip expensive audio processing if voice is cached
+             # Note: We check with EMPTY ref_text since the cached voice might have
+             # been stored with Whisper-transcribed text that we don't have yet
             if ref_audio_b64 and not voice_id:
-                # Quick hash of first 10KB to check cache
-                quick_voice_id = self._compute_voice_id(ref_audio_b64, ref_text, x_vector_only)
-                cached = self.get_cached_voice(quick_voice_id)
+                # Quick hash using ONLY audio (ignore ref_text for cache lookup)
+                quick_voice_id = self._compute_voice_id(ref_audio_b64, "", x_vector_only)
+                cached = self.get_cached_voice(quick_voice_id) 
                 if cached:
                     logger.info(f"Voice found in cache via quick hash: {quick_voice_id} (skipping audio decode/transcription)")
                     voice_id = quick_voice_id
@@ -435,7 +437,8 @@ class Qwen3TTSServer:
 
             # Compute voice ID if not provided
             if not voice_id:
-                voice_id = self._compute_voice_id(ref_audio_b64, ref_text, x_vector_only)
+                # Use empty ref_text for voice_id so cache lookups work before transcription
+                voice_id = self._compute_voice_id(ref_audio_b64, "", x_vector_only)
 
             # Check if already cached
             cached = self.get_cached_voice(voice_id)
