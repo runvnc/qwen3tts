@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Qwen3-TTS WebSocket Streaming Server
+Qwen3-TTS WebSocket Streaming Server (with true streaming generation)
 
 This server provides:
 1. Voice cloning with reference audio
@@ -21,6 +21,10 @@ Message Types (client -> server):
   
 - {"type": "generate", "text": "Full text here"}
   Generate audio for complete text (non-streaming input)
+
+- {"type": "generate_stream", "text": "Full text here"}
+  Generate audio with TRUE STREAMING - yields audio chunks as tokens are generated
+  (much lower latency than "generate")
 
 - {"type": "cancel"}
   Cancel current generation
@@ -66,6 +70,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Reduce noisy upstream INFO logs (Qwen/Transformers can be very chatty).
+for _name in ("qwen_tts", "qwen_tts.core.models.configuration_qwen3_tts", "transformers", "transformers.generation"):
+    logging.getLogger(_name).setLevel(logging.WARNING)
+try:
+    import transformers
+    try:
+        transformers.utils.logging.set_verbosity_error()
+    except Exception:
+        pass
+except Exception:
+    pass
+
+# Reduce noisy logs from upstream libs (can be overridden by user log config)
+logging.getLogger("qwen_tts").setLevel(logging.WARNING)
+logging.getLogger("qwen_tts.core.models.configuration_qwen3_tts").setLevel(logging.WARNING)
+logging.getLogger("transformers").setLevel(logging.WARNING)
+
+
 # Try to import qwen_tts
 try:
     from qwen_tts import Qwen3TTSModel, VoiceClonePromptItem
@@ -85,6 +107,14 @@ except ImportError:
     logger.warning("whisper not available, auto-transcription disabled")
     WHISPER_AVAILABLE = False
     whisper = None
+
+# Try to import streaming engine
+try:
+    from streaming_engine import Qwen3StreamingEngine
+    STREAMING_ENGINE_AVAILABLE = True
+except ImportError:
+    logger.warning("streaming_engine not available, true streaming disabled")
+    STREAMING_ENGINE_AVAILABLE = False
 
 # Audio conversion utilities
 def float32_to_ulaw(audio: np.ndarray, sample_rate: int = 24000, target_rate: int = 8000) -> bytes:
@@ -184,6 +214,9 @@ class Qwen3TTSServer:
         # Persistent voice cache (survives across connections)
         self.voice_cache: Dict[str, List[Any]] = {}
         
+        # Streaming engine (initialized after model load)
+        self.streaming_engine = None
+        
     def _get_torch_dtype(self) -> torch.dtype:
         dtype_map = {
             "bfloat16": torch.bfloat16,
@@ -244,9 +277,35 @@ class Qwen3TTSServer:
             dtype=self._get_torch_dtype(),
             attn_implementation="flash_attention_2",
         )
+
+        # Silence the common HF generate warning by setting pad_token_id once.
+        # (The warning is emitted on every generate() call otherwise.)
+        try:
+            inner = getattr(self.model, "model", None)
+            gc = getattr(inner, "generation_config", None)
+            cfg = getattr(inner, "config", None)
+            eos_id = getattr(cfg, "eos_token_id", None)
+            if gc is not None and getattr(gc, "pad_token_id", None) is None and eos_id is not None:
+                gc.pad_token_id = eos_id
+                logger.info(f"Set generation_config.pad_token_id={eos_id} to avoid per-request warnings")
+        except Exception as e:
+            logger.debug(f"Could not set pad_token_id: {e}")
+
+        # Useful to verify we are not reloading model objects per request
+        try:
+            logger.info(f"Model object ids: wrapper={id(self.model)} inner={id(getattr(self.model,'model',None))}")
+        except Exception:
+            pass
         
         logger.info(f"Model loaded in {time.time() - start:.2f}s")
         self.model_path = model_to_load  # Update for status reporting
+        
+        # Initialize streaming engine
+        if STREAMING_ENGINE_AVAILABLE and self.model:
+            self.streaming_engine = Qwen3StreamingEngine(self.model)
+            logger.info("Streaming engine initialized")
+        else:
+            logger.warning("Streaming engine not available")
     
     def _decode_audio_input(self, audio_b64: str) -> Tuple[np.ndarray, int]:
         """Decode base64 audio to numpy array."""
@@ -410,6 +469,12 @@ class Qwen3TTSServer:
     ):
         """Generate audio for text."""
         try:
+            # Debug: confirm model is stable (not being recreated)
+            try:
+                logger.info(f"generate(): model_inner_id={id(getattr(self.model,'model',None))} voice_id={session.voice_id}")
+            except Exception:
+                pass
+
             text = data.get("text", "")
             language = data.get("language", "Auto")
             
@@ -484,6 +549,95 @@ class Qwen3TTSServer:
                 "message": str(e)
             }))
     
+    async def handle_generate_stream(
+        self,
+        websocket: WebSocketServerProtocol,
+        session: VoiceSession,
+        data: Dict[str, Any]
+    ):
+        """Generate audio with true streaming - yields chunks as tokens are generated."""
+        try:
+            text = data.get("text", "")
+            language = data.get("language", "Auto")
+            initial_chunk_tokens = data.get("initial_chunk_tokens", 8)  # ~0.67s
+            stream_chunk_tokens = data.get("stream_chunk_tokens", 8)    # ~0.67s
+            
+            if not text:
+                await websocket.send(json.dumps({
+                    "type": "error",
+                    "message": "text is required"
+                }))
+                return
+            
+            if not session.voice_prompt:
+                await websocket.send(json.dumps({
+                    "type": "error",
+                    "message": "Voice not initialized. Send init message first."
+                }))
+                return
+            
+            if not self.streaming_engine:
+                # Fall back to non-streaming
+                logger.warning("Streaming engine not available, falling back to non-streaming")
+                await self.handle_generate(websocket, session, data)
+                return
+            
+            session.is_generating = True
+            session.cancel_requested = False
+            
+            await websocket.send(json.dumps({"type": "audio_start"}))
+            
+            start_time = time.time()
+            chunk_count = 0
+            total_audio_bytes = 0
+            first_chunk_time = None
+            
+            # Stream audio chunks as they're generated
+            async for pcm_chunk in self.streaming_engine.generate_stream(
+                text=text,
+                voice_clone_prompt=session.voice_prompt,
+                language=language,
+                initial_chunk_tokens=initial_chunk_tokens,
+                stream_chunk_tokens=stream_chunk_tokens,
+            ):
+                if session.cancel_requested:
+                    logger.info("Generation cancelled")
+                    break
+                
+                # Record time to first chunk
+                if first_chunk_time is None:
+                    first_chunk_time = time.time() - start_time
+                    logger.info(f"First audio chunk in {first_chunk_time:.3f}s")
+                
+                # Convert float32 PCM to ulaw
+                audio = np.frombuffer(pcm_chunk, dtype=np.float32)
+                ulaw_audio = float32_to_ulaw(audio, 24000, 8000)
+                
+                # Split into 20ms chunks and send
+                ulaw_chunks = chunk_audio(ulaw_audio, 160)
+                for ulaw_chunk in ulaw_chunks:
+                    await websocket.send(ulaw_chunk)
+                    chunk_count += 1
+                    total_audio_bytes += len(ulaw_chunk)
+                
+                # Small yield to allow cancel checks
+                await asyncio.sleep(0)
+            
+            await websocket.send(json.dumps({"type": "audio_end"}))
+            
+            total_time = time.time() - start_time
+            logger.info(f"Streaming complete: {chunk_count} chunks, {total_audio_bytes} bytes in {total_time:.2f}s")
+            
+            session.is_generating = False
+            
+        except Exception as e:
+            logger.error(f"Error in handle_generate_stream: {e}")
+            session.is_generating = False
+            await websocket.send(json.dumps({
+                "type": "error",
+                "message": str(e)
+            }))
+    
     async def handle_text_stream(
         self,
         websocket: WebSocketServerProtocol,
@@ -534,6 +688,9 @@ class Qwen3TTSServer:
                     
                     elif msg_type == "generate":
                         await self.handle_generate(websocket, session, data)
+                    
+                    elif msg_type == "generate_stream":
+                        await self.handle_generate_stream(websocket, session, data)
                     
                     elif msg_type == "text":
                         await self.handle_text_stream(websocket, session, data)
