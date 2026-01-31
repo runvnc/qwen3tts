@@ -80,11 +80,7 @@ class Qwen3StreamingEngine:
         initial_tokens = initial_chunk_tokens or self.initial_chunk_tokens
         stream_tokens = stream_chunk_tokens or self.stream_chunk_tokens
         
-         logger.info(f"StreamingEngine.generate_stream: text='{text[:50]}...' initial_tokens={initial_tokens} stream_tokens={stream_tokens}")
-        t_start = time.time()
-        t_first_token = None
-        
-       with torch.no_grad():
+        with torch.no_grad():
             # Convert prompt items to internal format
             voice_clone_prompt_dict = self.wrapper._prompt_items_to_voice_clone_prompt(voice_clone_prompt)
             ref_code = voice_clone_prompt_dict["ref_code"][0]
@@ -224,11 +220,6 @@ class Qwen3StreamingEngine:
                 next_token = sample_token(outputs.logits[:, -1, :])
                 current_input_ids = next_token
                 
-                # Track first token time
-                if t_first_token is None:
-                    t_first_token = time.time()
-                    logger.info(f"StreamingEngine: first token at +{(t_first_token-t_start)*1000:.0f}ms")
-                
                 # Check for end of sequence
                 if next_token.item() == eos_token_id:
                     break
@@ -249,7 +240,6 @@ class Qwen3StreamingEngine:
                         # Decode chunk with context
                         to_decode = torch.stack(chunk_buffer, dim=0)
                         audio_chunk = self._decode_with_context(to_decode, context)
-                        logger.info(f"StreamingEngine: decoded chunk {chunk_count+1}, {len(audio_chunk)} samples")
                         
                         # Apply crossfade if not first chunk
                         if prev_chunk_tail is not None:
@@ -262,9 +252,6 @@ class Qwen3StreamingEngine:
                             yield audio_chunk[:-fade_len].tobytes()
                         else:
                             yield audio_chunk.tobytes()
-            
-            t_end = time.time()
-            logger.info(f"StreamingEngine: generation complete in {(t_end-t_start)*1000:.0f}ms")
                             prev_chunk_tail = None
                         
                         # Update history
@@ -272,18 +259,13 @@ class Qwen3StreamingEngine:
                         chunk_buffer = []
                         is_first_chunk = False
             
-             chunk_count = 0  # Reset for final count
-            
-           # Flush remaining buffer
+            # Flush remaining buffer
             if chunk_buffer:
                 context = history_codes[-self.context_size:] if len(history_codes) > self.context_size else history_codes
                 audio_chunk = self._decode_with_context(torch.stack(chunk_buffer, dim=0), context)
                 if prev_chunk_tail is not None:
                     audio_chunk = self._apply_crossfade(prev_chunk_tail, audio_chunk)
                 yield audio_chunk.tobytes()
-            
-            t_end = time.time()
-            logger.info(f"StreamingEngine: generation complete in {(t_end-t_start)*1000:.0f}ms")
     
     def _apply_crossfade(self, tail: np.ndarray, current: np.ndarray) -> np.ndarray:
         """Apply linear crossfade between chunks to eliminate clicks."""
@@ -303,11 +285,7 @@ class Qwen3StreamingEngine:
         The decoder needs context to produce stable output, so we decode
         context + new_codes together, then trim the context portion.
         """
-         logger.info(f"StreamingEngine.generate_stream: text='{text[:50]}...' initial_tokens={initial_tokens} stream_tokens={stream_tokens}")
-        t_start = time.time()
-        t_first_token = None
-        
-       with torch.no_grad():
+        with torch.no_grad():
             # Decode context to get trim length
             wav_ctx_all, _ = self.tokenizer.decode([{"audio_codes": context_codes}])
             trim_samples = len(wav_ctx_all[0])
