@@ -42,10 +42,11 @@ class Qwen3StreamingEngine:
             self.upsample_rate = 2000
         
         # Default chunk sizes (in tokens, ~83ms per token at 12Hz)
-        self.initial_chunk_tokens = 8  # ~0.67s - can be tuned down for lower latency
-        self.stream_chunk_tokens = 8   # ~0.67s per subsequent chunk
+        self.initial_chunk_tokens = 6  # ~0.5s - reduced for lower latency
+        self.stream_chunk_tokens = 4   # ~0.33s per subsequent chunk (smaller = smoother)
         self.context_size = 38         # ~3s context for decoding stability
         self.crossfade_samples = 240   # ~10ms at 24kHz
+        self.min_buffer_chunks = 2    # Minimum chunks to buffer before yielding (smooths playback)
         
         logger.info(f"StreamingEngine initialized: initial_chunk={self.initial_chunk_tokens}, "
                    f"stream_chunk={self.stream_chunk_tokens}, context={self.context_size}")

@@ -15,10 +15,10 @@ Protocol:
 Message Types (client -> server):
 - {"type": "init", "ref_audio_base64": "...", "ref_text": "...", "language": "Auto"}
   Initialize voice clone with reference audio
-  
+
 - {"type": "text", "text": "Hello world", "final": false}
   Send text chunk. Set final=true when done with utterance.
-  
+
 - {"type": "generate", "text": "Full text here"}
   Generate audio for complete text (non-streaming input)
 
@@ -32,15 +32,15 @@ Message Types (client -> server):
 Message Types (server -> client):
 - {"type": "ready", "voice_loaded": true}
   Server ready, voice clone initialized
-  
+
 - {"type": "audio_start"}
   Audio generation starting
-  
+
 - Binary data: raw ulaw 8kHz audio chunks (~20ms each, 160 bytes)
-  
+
 - {"type": "audio_end"}
   Audio generation complete
-  
+
 - {"type": "error", "message": "..."}
   Error occurred
 """
@@ -118,9 +118,7 @@ except ImportError:
 
 # Audio conversion utilities
 def float32_to_ulaw(audio: np.ndarray, sample_rate: int = 24000, target_rate: int = 8000) -> bytes:
-    """Convert float32 audio to ulaw 8kHz for SIP/telephony."""
-    import audioop
-    
+
     # Resample if needed
     if sample_rate != target_rate:
         # Simple linear interpolation resampling
@@ -128,15 +126,37 @@ def float32_to_ulaw(audio: np.ndarray, sample_rate: int = 24000, target_rate: in
         target_samples = int(duration * target_rate)
         indices = np.linspace(0, len(audio) - 1, target_samples)
         audio = np.interp(indices, np.arange(len(audio)), audio)
-    
+
     # Normalize and convert to 16-bit PCM
     audio = np.clip(audio, -1.0, 1.0)
     pcm16 = (audio * 32767).astype(np.int16)
     pcm_bytes = pcm16.tobytes()
+
     
-    # Convert to ulaw
-    ulaw_bytes = audioop.lin2ulaw(pcm_bytes, 2)
-    return ulaw_bytes
+    # Convert to ulaw using numpy (avoids deprecated audioop)
+    ulaw_bytes = _pcm16_to_ulaw_numpy(pcm16)
+    return ulaw_bytes.astype(np.uint8).tobytes()
+
+
+def _pcm16_to_ulaw_numpy(pcm16: np.ndarray) -> bytes:
+    """Convert 16-bit PCM to u-law using numpy (no audioop dependency)."""
+    # u-law compression constants
+    BIAS = 0x84
+    CLIP = 32635
+    
+    # Work with absolute values, track sign
+    sign = (pcm16 < 0).astype(np.uint8) * 0x80
+    pcm16 = np.abs(pcm16).clip(0, CLIP)
+    pcm16 = pcm16 + BIAS
+    
+    # Compute exponent and mantissa
+    exponent = np.floor(np.log2(pcm16)).astype(np.uint8) - 7
+    exponent = np.clip(exponent, 0, 7)
+    mantissa = (pcm16 >> (exponent + 3)) & 0x0F
+    
+    # Combine into u-law byte
+    ulaw_bytes = ~(sign | (exponent << 4) | mantissa) & 0xFF
+    return ulaw_bytes.astype(np.uint8).tobytes()
 
 
 def chunk_audio(audio_bytes: bytes, chunk_size: int = 160) -> List[bytes]:
@@ -168,12 +188,12 @@ def transcribe_audio(audio: np.ndarray, sr: int) -> str:
     model = get_whisper_model()
     if model is None:
         return ""
-    
+
     # Whisper expects 16kHz audio
     if sr != 16000:
         import librosa
         audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
-    
+
     result = model.transcribe(audio, fp16=False)
     return result.get('text', '').strip()
 
@@ -191,7 +211,7 @@ class VoiceSession:
 
 class Qwen3TTSServer:
     """WebSocket server for Qwen3-TTS streaming."""
-    
+
     def __init__(
         self,
         model_path: str = None,  # Auto-detect based on VRAM
@@ -207,16 +227,16 @@ class Qwen3TTSServer:
         self.dtype = dtype
         self.host = host
         self.port = port
-        
+
         self.model: Optional[Qwen3TTSModel] = None
         self.sessions: Dict[str, VoiceSession] = {}
-        
+
         # Persistent voice cache (survives across connections)
         self.voice_cache: Dict[str, List[Any]] = {}
-        
+
         # Streaming engine (initialized after model load)
         self.streaming_engine = None
-        
+
     def _get_torch_dtype(self) -> torch.dtype:
         dtype_map = {
             "bfloat16": torch.bfloat16,
@@ -227,26 +247,26 @@ class Qwen3TTSServer:
             "fp32": torch.float32,
         }
         return dtype_map.get(self.dtype.lower(), torch.bfloat16)
-    
+
     def _detect_model(self) -> str:
         """Auto-detect which model to use based on available VRAM."""
         if self.model_path:
             return self.model_path
-        
+
         # Default models
         large_model = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
         small_model = self.fallback_model
-        
+
         try:
             if torch.cuda.is_available():
                 # Get available VRAM in GB
                 device_idx = 0
                 if ":" in self.device:
                     device_idx = int(self.device.split(":")[1])
-                
+
                 total_vram = torch.cuda.get_device_properties(device_idx).total_memory / (1024**3)
                 logger.info(f"Detected {total_vram:.1f}GB VRAM on {self.device}")
-                
+
                 # Use 1.7B if we have >= 12GB VRAM, otherwise 0.6B
                 if total_vram >= 12:
                     logger.info(f"Using 1.7B model (sufficient VRAM)")
@@ -260,17 +280,17 @@ class Qwen3TTSServer:
         except Exception as e:
             logger.warning(f"VRAM detection failed: {e}, defaulting to 1.7B")
             return large_model
-    
+
     async def load_model(self):
         """Load the Qwen3-TTS model."""
         if not QWEN_TTS_AVAILABLE:
             logger.warning("Running in mock mode - no model loaded")
             return
-        
+
         model_to_load = self._detect_model()
         logger.info(f"Loading model from {model_to_load}...")
         start = time.time()
-        
+
         self.model = Qwen3TTSModel.from_pretrained(
             model_to_load,
             device_map=self.device,
@@ -296,36 +316,36 @@ class Qwen3TTSServer:
             logger.info(f"Model object ids: wrapper={id(self.model)} inner={id(getattr(self.model,'model',None))}")
         except Exception:
             pass
-        
+
         logger.info(f"Model loaded in {time.time() - start:.2f}s")
         self.model_path = model_to_load  # Update for status reporting
-        
+
         # Initialize streaming engine
         if STREAMING_ENGINE_AVAILABLE and self.model:
             self.streaming_engine = Qwen3StreamingEngine(self.model)
             logger.info("Streaming engine initialized")
         else:
             logger.warning("Streaming engine not available")
-    
+
     def _decode_audio_input(self, audio_b64: str) -> Tuple[np.ndarray, int]:
         """Decode base64 audio to numpy array."""
         import soundfile as sf
-        
+
         # Handle data URL format
         if audio_b64.startswith("data:"):
             audio_b64 = audio_b64.split(",", 1)[1]
-        
+
         audio_bytes = base64.b64decode(audio_b64)
-        
+
         with io.BytesIO(audio_bytes) as f:
             audio, sr = sf.read(f, dtype="float32")
-        
+
         # Convert to mono if stereo
         if audio.ndim > 1:
             audio = np.mean(audio, axis=-1)
-        
+
         return audio.astype(np.float32), int(sr)
-    
+
     def _compute_voice_id(self, audio_b64: str, ref_text: str, x_vector_only: bool) -> str:
         """Compute a unique ID for a voice based on audio and text."""
         # Hash the audio and text to create a unique ID
@@ -334,16 +354,16 @@ class Qwen3TTSServer:
         hasher.update(ref_text.encode('utf-8'))
         hasher.update(str(x_vector_only).encode('utf-8'))
         return hasher.hexdigest()[:16]
-    
+
     def get_cached_voice(self, voice_id: str) -> Optional[List[Any]]:
         """Get a cached voice prompt by ID."""
         return self.voice_cache.get(voice_id)
-    
+
     def cache_voice(self, voice_id: str, prompt: List[Any]):
         """Cache a voice prompt."""
         self.voice_cache[voice_id] = prompt
         logger.info(f"Cached voice {voice_id}, total cached: {len(self.voice_cache)}")
-    
+
     async def handle_init(
         self,
         websocket: WebSocketServerProtocol,
@@ -357,6 +377,18 @@ class Qwen3TTSServer:
             ref_text = data.get("ref_text", "")
             auto_transcribe = data.get("auto_transcribe", False)
             x_vector_only = data.get("x_vector_only", False)
+
+
+            # Compute voice_id from audio hash BEFORE decoding (fast check)
+            # This allows us to skip expensive audio processing if voice is cached
+            if ref_audio_b64 and not voice_id:
+                # Quick hash of first 10KB to check cache
+                quick_voice_id = self._compute_voice_id(ref_audio_b64, ref_text, x_vector_only)
+                cached = self.get_cached_voice(quick_voice_id)
+                if cached:
+                    logger.info(f"Voice found in cache via quick hash: {quick_voice_id} (skipping audio decode/transcription)")
+                    voice_id = quick_voice_id
+                    ref_audio_b64 = None  # Skip audio processing
 
             # Allow init with ONLY voice_id (no audio upload) to re-bind a cached voice prompt
             # to this *connection's* session after reconnects.
@@ -379,18 +411,18 @@ class Qwen3TTSServer:
                     "message": f"voice_id not found in cache: {voice_id}"
                 }))
                 return
-            
+
             if not ref_audio_b64:
                 await websocket.send(json.dumps({
                     "type": "error",
                     "message": "ref_audio_base64 is required (or provide cached voice_id)"
                 }))
                 return
-            
+
             # Decode audio first (needed for transcription and voice ID)
             audio, sr = self._decode_audio_input(ref_audio_b64)
             logger.info(f"Reference audio: {len(audio)/sr:.2f}s at {sr}Hz")
-            
+
             # Auto-transcribe if requested and no ref_text provided
             if auto_transcribe and not ref_text:
                 if WHISPER_AVAILABLE:
@@ -400,11 +432,11 @@ class Qwen3TTSServer:
                 else:
                     logger.warning("Auto-transcribe requested but Whisper not available")
                     x_vector_only = True  # Fall back to x-vector only mode
-            
+
             # Compute voice ID if not provided
             if not voice_id:
                 voice_id = self._compute_voice_id(ref_audio_b64, ref_text, x_vector_only)
-            
+
             # Check if already cached
             cached = self.get_cached_voice(voice_id)
             if cached:
@@ -419,14 +451,14 @@ class Qwen3TTSServer:
                     "cached": True
                 }))
                 return
-            
+
             if not x_vector_only and not ref_text:
                 await websocket.send(json.dumps({
                     "type": "error", 
                     "message": "ref_text is required when x_vector_only is false"
                 }))
                 return
-            
+
             if self.model:
                 # Create voice clone prompt
                 prompt_items = self.model.create_voice_clone_prompt(
@@ -436,7 +468,7 @@ class Qwen3TTSServer:
                 )
                 session.voice_prompt = prompt_items
                 session.sample_rate = 24000  # Qwen3-TTS output rate
-                
+
                 # Cache the voice prompt
                 self.cache_voice(voice_id, prompt_items)
                 session.voice_id = voice_id
@@ -445,7 +477,7 @@ class Qwen3TTSServer:
                 # Mock mode
                 session.voice_prompt = [{"mock": True}]
                 logger.info("Mock voice prompt created")
-            
+
             await websocket.send(json.dumps({
                 "type": "ready",
                 "voice_loaded": True,
@@ -453,14 +485,14 @@ class Qwen3TTSServer:
                 "ref_text": ref_text,
                 "cached": False
             }))
-            
+
         except Exception as e:
             logger.error(f"Error in handle_init: {e}")
             await websocket.send(json.dumps({
                 "type": "error",
                 "message": str(e)
             }))
-    
+
     async def handle_generate(
         self,
         websocket: WebSocketServerProtocol,
@@ -477,28 +509,28 @@ class Qwen3TTSServer:
 
             text = data.get("text", "")
             language = data.get("language", "Auto")
-            
+
             if not text:
                 await websocket.send(json.dumps({
                     "type": "error",
                     "message": "text is required"
                 }))
                 return
-            
+
             if not session.voice_prompt:
                 await websocket.send(json.dumps({
                     "type": "error",
                     "message": "Voice not initialized. Send init message first."
                 }))
                 return
-            
+
             session.is_generating = True
             session.cancel_requested = False
-            
+
             await websocket.send(json.dumps({"type": "audio_start"}))
-            
+
             start_time = time.time()
-            
+
             if self.model:
                 # Generate with Qwen3-TTS
                 wavs, sr = self.model.generate_voice_clone(
@@ -506,10 +538,10 @@ class Qwen3TTSServer:
                     language=language,
                     voice_clone_prompt=session.voice_prompt,
                 )
-                
+
                 audio = wavs[0]
                 logger.info(f"Generated {len(audio)/sr:.2f}s audio in {time.time()-start_time:.2f}s")
-                
+
             else:
                 # Mock mode - generate silence
                 sr = 24000
@@ -517,30 +549,30 @@ class Qwen3TTSServer:
                 audio = np.zeros(int(sr * duration), dtype=np.float32)
                 await asyncio.sleep(0.5)  # Simulate generation time
                 logger.info(f"Mock generated {duration:.2f}s audio")
-            
+
             # Convert to ulaw and chunk
             ulaw_audio = float32_to_ulaw(audio, sr, 8000)
             chunks = chunk_audio(ulaw_audio, 160)
-            
+
             # Stream chunks with pacing
             chunk_duration = 0.020  # 20ms per chunk
-            
+
             for i, chunk in enumerate(chunks):
                 if session.cancel_requested:
                     logger.info("Generation cancelled")
                     break
-                
+
                 await websocket.send(chunk)
-                
+
                 # Pace output to roughly match real-time
                 # (can be adjusted for faster-than-realtime streaming)
                 if i < len(chunks) - 1:
                     await asyncio.sleep(chunk_duration * 0.5)  # 2x realtime
-            
+
             await websocket.send(json.dumps({"type": "audio_end"}))
-            
+
             session.is_generating = False
-            
+
         except Exception as e:
             logger.error(f"Error in handle_generate: {e}")
             session.is_generating = False
@@ -548,7 +580,7 @@ class Qwen3TTSServer:
                 "type": "error",
                 "message": str(e)
             }))
-    
+
     async def handle_generate_stream(
         self,
         websocket: WebSocketServerProtocol,
@@ -561,37 +593,37 @@ class Qwen3TTSServer:
             language = data.get("language", "Auto")
             initial_chunk_tokens = data.get("initial_chunk_tokens", 8)  # ~0.67s
             stream_chunk_tokens = data.get("stream_chunk_tokens", 8)    # ~0.67s
-            
+
             if not text:
                 await websocket.send(json.dumps({
                     "type": "error",
                     "message": "text is required"
                 }))
                 return
-            
+
             if not session.voice_prompt:
                 await websocket.send(json.dumps({
                     "type": "error",
                     "message": "Voice not initialized. Send init message first."
                 }))
                 return
-            
+
             if not self.streaming_engine:
                 # Fall back to non-streaming
                 logger.warning("Streaming engine not available, falling back to non-streaming")
                 await self.handle_generate(websocket, session, data)
                 return
-            
+
             session.is_generating = True
             session.cancel_requested = False
-            
+
             await websocket.send(json.dumps({"type": "audio_start"}))
-            
+
             start_time = time.time()
             chunk_count = 0
             total_audio_bytes = 0
             first_chunk_time = None
-            
+
             # Stream audio chunks as they're generated
             async for pcm_chunk in self.streaming_engine.generate_stream(
                 text=text,
@@ -603,33 +635,33 @@ class Qwen3TTSServer:
                 if session.cancel_requested:
                     logger.info("Generation cancelled")
                     break
-                
+
                 # Record time to first chunk
                 if first_chunk_time is None:
                     first_chunk_time = time.time() - start_time
                     logger.info(f"First audio chunk in {first_chunk_time:.3f}s")
-                
+
                 # Convert float32 PCM to ulaw
                 audio = np.frombuffer(pcm_chunk, dtype=np.float32)
                 ulaw_audio = float32_to_ulaw(audio, 24000, 8000)
-                
+
                 # Split into 20ms chunks and send
                 ulaw_chunks = chunk_audio(ulaw_audio, 160)
                 for ulaw_chunk in ulaw_chunks:
                     await websocket.send(ulaw_chunk)
                     chunk_count += 1
                     total_audio_bytes += len(ulaw_chunk)
-                
+
                 # Small yield to allow cancel checks
                 await asyncio.sleep(0)
-            
+
             await websocket.send(json.dumps({"type": "audio_end"}))
-            
+
             total_time = time.time() - start_time
             logger.info(f"Streaming complete: {chunk_count} chunks, {total_audio_bytes} bytes in {total_time:.2f}s")
-            
+
             session.is_generating = False
-            
+
         except Exception as e:
             logger.error(f"Error in handle_generate_stream: {e}")
             session.is_generating = False
@@ -637,7 +669,7 @@ class Qwen3TTSServer:
                 "type": "error",
                 "message": str(e)
             }))
-    
+
     async def handle_text_stream(
         self,
         websocket: WebSocketServerProtocol,
@@ -647,9 +679,9 @@ class Qwen3TTSServer:
         """Handle streaming text input."""
         text = data.get("text", "")
         is_final = data.get("final", False)
-        
+
         session.text_buffer += text
-        
+
         if is_final and session.text_buffer:
             # Generate for accumulated text
             await self.handle_generate(
@@ -658,67 +690,67 @@ class Qwen3TTSServer:
                 {"text": session.text_buffer, "language": data.get("language", "Auto")}
             )
             session.text_buffer = ""
-    
+
     async def handle_connection(self, websocket: WebSocketServerProtocol):
         """Handle a WebSocket connection."""
         session_id = str(id(websocket))
         session = VoiceSession()
         self.sessions[session_id] = session
-        
+
         logger.info(f"New connection: {session_id}")
-        
+
         try:
             await websocket.send(json.dumps({
                 "type": "connected",
                 "model": self.model_path,
                 "mock_mode": not QWEN_TTS_AVAILABLE
             }))
-            
+
             async for message in websocket:
                 if isinstance(message, bytes):
                     # Binary messages not expected from client
                     continue
-                
+
                 try:
                     data = json.loads(message)
                     msg_type = data.get("type", "")
-                    
+
                     if msg_type == "init":
                         await self.handle_init(websocket, session, data)
-                    
+
                     elif msg_type == "generate":
                         await self.handle_generate(websocket, session, data)
-                    
+
                     elif msg_type == "generate_stream":
                         await self.handle_generate_stream(websocket, session, data)
-                    
+
                     elif msg_type == "text":
                         await self.handle_text_stream(websocket, session, data)
-                    
+
                     elif msg_type == "cancel":
                         session.cancel_requested = True
                         logger.info("Cancel requested")
-                    
+
                     elif msg_type == "ping":
                         await websocket.send(json.dumps({"type": "pong"}))
-                    
+
                     else:
                         logger.warning(f"Unknown message type: {msg_type}")
-                        
+
                 except json.JSONDecodeError:
                     logger.error(f"Invalid JSON: {message[:100]}")
-                    
+
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"Connection closed: {session_id}")
         finally:
             del self.sessions[session_id]
-    
+
     async def run(self):
         """Start the WebSocket server."""
         await self.load_model()
-        
+
         logger.info(f"Starting WebSocket server on {self.host}:{self.port}")
-        
+
         async with websockets.serve(
             self.handle_connection,
             self.host,
@@ -730,7 +762,7 @@ class Qwen3TTSServer:
 
 def main():
     import argparse
-    
+
     parser = argparse.ArgumentParser(description="Qwen3-TTS WebSocket Server")
     parser.add_argument(
         "--model", "-m",
@@ -759,9 +791,9 @@ def main():
         default=int(os.environ.get("QWEN3_TTS_PORT", "8765")),
         help="Server port"
     )
-    
+
     args = parser.parse_args()
-    
+
     server = Qwen3TTSServer(
         model_path=args.model,
         device=args.device,
@@ -769,7 +801,7 @@ def main():
         host=args.host,
         port=args.port,
     )
-    
+
     asyncio.run(server.run())
 
 
