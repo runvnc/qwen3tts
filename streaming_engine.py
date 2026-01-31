@@ -53,13 +53,14 @@ class Qwen3StreamingEngine:
         except:
             self.upsample_rate = 2000
         
-        # Chunk sizes (in tokens, ~83ms per token at 12Hz)
-        self.initial_chunk_tokens = 6
-        self.stream_chunk_tokens = 4
+        # Chunk sizes - REDUCED for lower latency
+        # Each token is ~83ms at 12Hz
+        self.initial_chunk_tokens = 4  # ~333ms (was 6-8)
+        self.stream_chunk_tokens = 4   # ~333ms
         self.context_size = 38
         self.crossfade_samples = 240
         
-        logger.info(f"StreamingEngine initialized with embedding cache")
+        logger.info(f"StreamingEngine: initial={self.initial_chunk_tokens}, stream={self.stream_chunk_tokens}")
     
     def _precompute_constants(self):
         """Pre-compute TTS constant embeddings (BOS, EOS, PAD)."""
@@ -85,34 +86,26 @@ class Qwen3StreamingEngine:
         voice_clone_prompt: list,
         language: str = "Auto"
     ) -> Dict[str, Any]:
-        """Pre-compute and cache embeddings for a voice.
-        
-        Call this during voice init to eliminate latency during generation.
-        """
+        """Pre-compute and cache embeddings for a voice."""
         t0 = time.time()
         timings = {}
         
         with torch.no_grad():
-            # Convert prompt items
             t1 = time.time()
             voice_clone_prompt_dict = self.wrapper._prompt_items_to_voice_clone_prompt(voice_clone_prompt)
             timings['prompt_convert'] = (time.time() - t1) * 1000
             
-            # Get ref_code
             t1 = time.time()
             ref_code = voice_clone_prompt_dict["ref_code"][0].to(self.device)
             timings['ref_code'] = (time.time() - t1) * 1000
             
-            # Generate speaker embedding
             t1 = time.time()
             voice_clone_spk_embeds = self.model.generate_speaker_prompt(voice_clone_prompt_dict)
             speaker_embed = voice_clone_spk_embeds[0]
             timings['speaker_embed'] = (time.time() - t1) * 1000
             
-            # Get language ID
             language_id = self.model.config.talker_config.codec_language_id.get(language.lower())
             
-            # Build codec prefill sequence
             t1 = time.time()
             codec_prefill_ids = [
                 self.model.config.talker_config.codec_think_id if language_id 
@@ -123,7 +116,6 @@ class Qwen3StreamingEngine:
                 codec_prefill_ids.append(language_id)
             codec_prefill_ids.append(self.model.config.talker_config.codec_think_eos_id)
             
-            # Build codec input embeddings
             codec_input_embedding_0 = self.talker.get_input_embeddings()(
                 torch.tensor([codec_prefill_ids], device=self.device)
             )
@@ -140,14 +132,12 @@ class Qwen3StreamingEngine:
             ], dim=1)
             timings['codec_embed'] = (time.time() - t1) * 1000
             
-            # Get ref text IDs for ICL mode
             ref_texts = [it.ref_text for it in voice_clone_prompt]
             ref_ids = [
                 self.wrapper._tokenize_texts([self.wrapper._build_ref_text(rt)])[0] if rt else None 
                 for rt in ref_texts
             ]
             
-            # Cache everything
             embeddings = {
                 'voice_clone_prompt_dict': voice_clone_prompt_dict,
                 'ref_code': ref_code,
@@ -183,12 +173,12 @@ class Qwen3StreamingEngine:
         stream_tokens = stream_chunk_tokens or self.stream_chunk_tokens
         
         t_start = time.time()
-        timings = {}
+        token_times = []  # Track time for each token
         
         def mark(name):
             elapsed = (time.time() - t_start) * 1000
-            timings[name] = elapsed
             logger.info(f"[streaming_engine] {name}: +{elapsed:.0f}ms")
+            return elapsed
         
         mark("start")
         
@@ -209,22 +199,18 @@ class Qwen3StreamingEngine:
                 icl_mode = cached_embeds['icl_mode']
             else:
                 mark("cache_miss")
-                # Convert prompt items
                 voice_clone_prompt_dict = self.wrapper._prompt_items_to_voice_clone_prompt(voice_clone_prompt)
                 mark("prompt_converted")
                 
                 ref_code = voice_clone_prompt_dict["ref_code"][0].to(self.device)
                 mark("ref_code_loaded")
                 
-                # Generate speaker embedding
                 voice_clone_spk_embeds = self.model.generate_speaker_prompt(voice_clone_prompt_dict)
                 speaker_embed = voice_clone_spk_embeds[0]
                 mark("speaker_embed_generated")
                 
-                # Get language ID
                 language_id = self.model.config.talker_config.codec_language_id.get(language.lower())
                 
-                # Build codec prefill
                 codec_prefill_ids = [
                     self.model.config.talker_config.codec_think_id if language_id 
                     else self.model.config.talker_config.codec_nothink_id,
@@ -326,8 +312,12 @@ class Qwen3StreamingEngine:
             
             mark("ready_to_generate")
             
-            # Main generation loop
+            # Main generation loop with per-token timing
+            t_token_start = time.time()
+            
             for i in range(max_new_tokens):
+                t_forward_start = time.time()
+                
                 outputs = self.talker.forward(
                     input_ids=current_input_ids,
                     inputs_embeds=current_inputs_embeds,
@@ -340,8 +330,18 @@ class Qwen3StreamingEngine:
                     subtalker_dosample=True
                 )
                 
+                t_forward_end = time.time()
+                forward_ms = (t_forward_end - t_forward_start) * 1000
+                
                 if i == 0:
                     mark("first_forward_pass")
+                    logger.info(f"[streaming_engine] first forward took {forward_ms:.1f}ms")
+                
+                # Track token timing for first chunk
+                if is_first_chunk:
+                    token_times.append(forward_ms)
+                    if len(token_times) <= initial_tokens:
+                        logger.info(f"[streaming_engine] token {i}: {forward_ms:.1f}ms (total: {sum(token_times):.1f}ms)")
                 
                 past_key_values = outputs.past_key_values
                 past_hidden = outputs.past_hidden
@@ -367,11 +367,15 @@ class Qwen3StreamingEngine:
                         
                         if is_first_chunk:
                             mark("decoding_first_chunk")
+                            logger.info(f"[streaming_engine] token generation took {sum(token_times):.1f}ms for {len(token_times)} tokens")
                         
+                        t_decode_start = time.time()
                         audio_chunk = self._decode_with_context(to_decode, context)
+                        t_decode_end = time.time()
                         
                         if is_first_chunk:
                             mark("first_chunk_decoded")
+                            logger.info(f"[streaming_engine] decode took {(t_decode_end-t_decode_start)*1000:.1f}ms")
                         
                         if prev_chunk_tail is not None:
                             audio_chunk = self._apply_crossfade(prev_chunk_tail, audio_chunk)
@@ -398,8 +402,9 @@ class Qwen3StreamingEngine:
                 yield audio_chunk.tobytes()
                 chunk_count += 1
             
+            total_ms = (time.time() - t_start) * 1000
             mark("generation_complete")
-            logger.info(f"[streaming_engine] Generated {chunk_count} chunks, timings: {timings}")
+            logger.info(f"[streaming_engine] Generated {chunk_count} chunks in {total_ms:.0f}ms")
     
     def _apply_crossfade(self, tail: np.ndarray, current: np.ndarray) -> np.ndarray:
         """Apply linear crossfade between chunks."""
