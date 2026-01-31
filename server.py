@@ -3,11 +3,6 @@
 Qwen3-TTS WebSocket Streaming Server
 
 Modular server with profiling and embedding caching for low latency.
-
-Protocol:
-- Connect to ws://host:port
-- Send JSON messages for control
-- Receive binary audio chunks (ulaw 8kHz) or JSON status messages
 """
 
 import asyncio
@@ -43,6 +38,10 @@ logger = logging.getLogger(__name__)
 # Reduce noisy upstream logs
 for _name in ("qwen_tts", "transformers", "transformers.generation"):
     logging.getLogger(_name).setLevel(logging.WARNING)
+
+# Default chunk tokens - REDUCED for lower latency
+DEFAULT_INITIAL_TOKENS = int(os.environ.get('QWEN3_INITIAL_TOKENS', '4'))
+DEFAULT_STREAM_TOKENS = int(os.environ.get('QWEN3_STREAM_TOKENS', '4'))
 
 # Try to import qwen_tts
 try:
@@ -85,6 +84,8 @@ class Qwen3TTSServer:
         self.sessions: Dict[str, VoiceSession] = {}
         self.voice_cache = VoiceCache(max_voices=50)
         self.streaming_engine = None
+        
+        logger.info(f"Server config: initial_tokens={DEFAULT_INITIAL_TOKENS}, stream_tokens={DEFAULT_STREAM_TOKENS}")
 
     def _get_torch_dtype(self) -> torch.dtype:
         dtype_map = {
@@ -383,11 +384,13 @@ class Qwen3TTSServer:
             text = data.get("text", "")
             language = data.get("language", "Auto")
             voice_id = data.get("voice_id") or session.voice_id
-            initial_chunk_tokens = data.get("initial_chunk_tokens", 8)
-            stream_chunk_tokens = data.get("stream_chunk_tokens", 8)
+            
+            # Use client-provided values or server defaults
+            initial_chunk_tokens = data.get("initial_chunk_tokens", DEFAULT_INITIAL_TOKENS)
+            stream_chunk_tokens = data.get("stream_chunk_tokens", DEFAULT_STREAM_TOKENS)
 
             profile.mark("params_parsed")
-            logger.info(f"generate_stream: text='{text[:50]}...' voice_id={voice_id}")
+            logger.info(f"generate_stream: text='{text[:50]}...' voice_id={voice_id} initial={initial_chunk_tokens} stream={stream_chunk_tokens}")
 
             if not text:
                 await websocket.send(json.dumps({"type": "error", "message": "text required"}))
@@ -417,7 +420,7 @@ class Qwen3TTSServer:
                 text=text,
                 voice_clone_prompt=session.voice_prompt,
                 language=language,
-                voice_id=voice_id,  # Pass voice_id for embedding cache lookup
+                voice_id=voice_id,
                 initial_chunk_tokens=initial_chunk_tokens,
                 stream_chunk_tokens=stream_chunk_tokens,
             ):
@@ -463,7 +466,6 @@ class Qwen3TTSServer:
         session = VoiceSession()
         self.sessions[session_id] = session
 
-        logger.info(f"connection open")
         logger.info(f"New connection: {session_id}")
 
         try:
