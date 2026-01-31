@@ -513,6 +513,8 @@ class Qwen3TTSServer:
             text = data.get("text", "")
             language = data.get("language", "Auto")
 
+             logger.info(f"generate_stream: text='{text[:100]}...' lang={language} initial={initial_chunk_tokens} stream={stream_chunk_tokens}")
+
             if not text:
                 await websocket.send(json.dumps({
                     "type": "error",
@@ -529,8 +531,6 @@ class Qwen3TTSServer:
 
             session.is_generating = True
             session.cancel_requested = False
-
-            await websocket.send(json.dumps({"type": "audio_start"}))
 
             start_time = time.time()
 
@@ -597,6 +597,8 @@ class Qwen3TTSServer:
             initial_chunk_tokens = data.get("initial_chunk_tokens", 8)  # ~0.67s
             stream_chunk_tokens = data.get("stream_chunk_tokens", 8)    # ~0.67s
 
+             logger.info(f"generate_stream: text='{text[:100]}...' lang={language} initial={initial_chunk_tokens} stream={stream_chunk_tokens}")
+
             if not text:
                 await websocket.send(json.dumps({
                     "type": "error",
@@ -620,9 +622,15 @@ class Qwen3TTSServer:
             session.is_generating = True
             session.cancel_requested = False
 
-            await websocket.send(json.dumps({"type": "audio_start"}))
-
             start_time = time.time()
+             t_audio_start = start_time
+
+             await websocket.send(json.dumps({"type": "audio_start"}))
+             logger.info(f"generate_stream: sent audio_start at +{(time.time()-start_time)*1000:.0f}ms")
+
+             # Timing tracking
+             t_first_yield = None
+             t_first_send = None
             chunk_count = 0
             total_audio_bytes = 0
             first_chunk_time = None
@@ -639,6 +647,12 @@ class Qwen3TTSServer:
                     logger.info("Generation cancelled")
                     break
 
+
+                 # Track when streaming engine first yields
+                 if t_first_yield is None:
+                     t_first_yield = time.time()
+                     logger.info(f"generate_stream: first yield from engine at +{(t_first_yield-start_time)*1000:.0f}ms")
+
                 # Record time to first chunk
                 if first_chunk_time is None:
                     first_chunk_time = time.time() - start_time
@@ -651,6 +665,10 @@ class Qwen3TTSServer:
                 # Split into 20ms chunks and send
                 ulaw_chunks = chunk_audio(ulaw_audio, 160)
                 for ulaw_chunk in ulaw_chunks:
+                     if t_first_send is None:
+                         t_first_send = time.time()
+                         logger.info(f"generate_stream: first chunk sent at +{(t_first_send-start_time)*1000:.0f}ms")
+
                     await websocket.send(ulaw_chunk)
                     chunk_count += 1
                     total_audio_bytes += len(ulaw_chunk)
@@ -663,150 +681,156 @@ class Qwen3TTSServer:
             total_time = time.time() - start_time
             logger.info(f"Streaming complete: {chunk_count} chunks, {total_audio_bytes} bytes in {total_time:.2f}s")
 
-            session.is_generating = False
-
-        except Exception as e:
-            logger.error(f"Error in handle_generate_stream: {e}")
-            session.is_generating = False
-            await websocket.send(json.dumps({
-                "type": "error",
-                "message": str(e)
-            }))
-
-    async def handle_text_stream(
-        self,
-        websocket: WebSocketServerProtocol,
-        session: VoiceSession,
-        data: Dict[str, Any]
-    ):
-        """Handle streaming text input."""
-        text = data.get("text", "")
-        is_final = data.get("final", False)
-
-        session.text_buffer += text
-
-        if is_final and session.text_buffer:
-            # Generate for accumulated text
-            await self.handle_generate(
-                websocket,
-                session,
-                {"text": session.text_buffer, "language": data.get("language", "Auto")}
-            )
-            session.text_buffer = ""
-
-    async def handle_connection(self, websocket: WebSocketServerProtocol):
-        """Handle a WebSocket connection."""
-        session_id = str(id(websocket))
-        session = VoiceSession()
-        self.sessions[session_id] = session
-
-        logger.info(f"New connection: {session_id}")
-
-        try:
-            await websocket.send(json.dumps({
-                "type": "connected",
-                "model": self.model_path,
-                "mock_mode": not QWEN_TTS_AVAILABLE
-            }))
-
-            async for message in websocket:
-                if isinstance(message, bytes):
-                    # Binary messages not expected from client
-                    continue
-
-                try:
-                    data = json.loads(message)
-                    msg_type = data.get("type", "")
-
-                    if msg_type == "init":
-                        await self.handle_init(websocket, session, data)
-
-                    elif msg_type == "generate":
-                        await self.handle_generate(websocket, session, data)
-
-                    elif msg_type == "generate_stream":
-                        await self.handle_generate_stream(websocket, session, data)
-
-                    elif msg_type == "text":
-                        await self.handle_text_stream(websocket, session, data)
-
-                    elif msg_type == "cancel":
-                        session.cancel_requested = True
-                        logger.info("Cancel requested")
-
-                    elif msg_type == "ping":
-                        await websocket.send(json.dumps({"type": "pong"}))
-
-                    else:
-                        logger.warning(f"Unknown message type: {msg_type}")
-
-                except json.JSONDecodeError:
-                    logger.error(f"Invalid JSON: {message[:100]}")
-
-        except websockets.exceptions.ConnectionClosed:
-            logger.info(f"Connection closed: {session_id}")
-        finally:
-            del self.sessions[session_id]
-
-    async def run(self):
-        """Start the WebSocket server."""
-        await self.load_model()
-
-        logger.info(f"Starting WebSocket server on {self.host}:{self.port}")
-
-        async with websockets.serve(
-            self.handle_connection,
-            self.host,
-            self.port,
-            max_size=50 * 1024 * 1024,  # 50MB max message size for audio
-        ):
-            await asyncio.Future()  # Run forever
+             # Calculate audio duration and RTF
+             audio_duration = total_audio_bytes / 8000  # 8kHz ulaw = 1 byte per sample
+             rtf = total_time / audio_duration if audio_duration > 0 else 0
+             logger.info(f"generate_stream: audio_duration={audio_duration:.2f}s RTF={rtf:.2f}x")
 
 
-def main():
-    import argparse
+             session.is_generating = False
 
-    parser = argparse.ArgumentParser(description="Qwen3-TTS WebSocket Server")
-    parser.add_argument(
-        "--model", "-m",
-        default=os.environ.get("QWEN3_TTS_MODEL", None),
-        help="Model path or HuggingFace repo (default: auto-detect based on VRAM, "
-             "1.7B for >=12GB, 0.6B otherwise)"
-    )
-    parser.add_argument(
-        "--device", "-d",
-        default=os.environ.get("QWEN3_TTS_DEVICE", "cuda:0"),
-        help="Device (cuda:0, cpu, etc.)"
-    )
-    parser.add_argument(
-        "--dtype",
-        default=os.environ.get("QWEN3_TTS_DTYPE", "bfloat16"),
-        help="Model dtype (bfloat16, float16, float32)"
-    )
-    parser.add_argument(
-        "--host",
-        default=os.environ.get("QWEN3_TTS_HOST", "0.0.0.0"),
-        help="Server host"
-    )
-    parser.add_argument(
-        "--port", "-p",
-        type=int,
-        default=int(os.environ.get("QWEN3_TTS_PORT", "8765")),
-        help="Server port"
-    )
+         except Exception as e:
+             logger.error(f"Error in handle_generate_stream: {e}")
+             session.is_generating = False
+             await websocket.send(json.dumps({
+                 "type": "error",
+                 "message": str(e)
+             }))
 
-    args = parser.parse_args()
+     async def handle_text_stream(
+         self,
+         websocket: WebSocketServerProtocol,
+         session: VoiceSession,
+         data: Dict[str, Any]
+     ):
+         """Handle streaming text input."""
+         text = data.get("text", "")
+         is_final = data.get("final", False)
 
-    server = Qwen3TTSServer(
-        model_path=args.model,
-        device=args.device,
-        dtype=args.dtype,
-        host=args.host,
-        port=args.port,
-    )
+         session.text_buffer += text
 
-    asyncio.run(server.run())
+         if is_final and session.text_buffer:
+             # Generate for accumulated text
+             await self.handle_generate(
+                 websocket,
+                 session,
+                 {"text": session.text_buffer, "language": data.get("language", "Auto")}
+             )
+             session.text_buffer = ""
+
+     async def handle_connection(self, websocket: WebSocketServerProtocol):
+         """Handle a WebSocket connection."""
+         session_id = str(id(websocket))
+         session = VoiceSession()
+         self.sessions[session_id] = session
+
+         logger.info(f"New connection: {session_id}")
+
+         try:
+             await websocket.send(json.dumps({
+                 "type": "connected",
+                 "model": self.model_path,
+                 "mock_mode": not QWEN_TTS_AVAILABLE
+             }))
+
+             async for message in websocket:
+                 if isinstance(message, bytes):
+                     # Binary messages not expected from client
+                     continue
+
+                 try:
+                     data = json.loads(message)
+                     msg_type = data.get("type", "")
+
+                     if msg_type == "init":
+                         await self.handle_init(websocket, session, data)
+
+                     elif msg_type == "generate":
+                         await self.handle_generate(websocket, session, data)
+
+                     elif msg_type == "generate_stream":
+                         await self.handle_generate_stream(websocket, session, data)
+
+                     elif msg_type == "text":
+                         await self.handle_text_stream(websocket, session, data)
+
+                     elif msg_type == "cancel":
+                         session.cancel_requested = True
+                         logger.info("Cancel requested")
+
+                     elif msg_type == "ping":
+                         await websocket.send(json.dumps({"type": "pong"}))
+
+                     else:
+                         logger.warning(f"Unknown message type: {msg_type}")
+
+                 except json.JSONDecodeError:
+                     logger.error(f"Invalid JSON: {message[:100]}")
+
+         except websockets.exceptions.ConnectionClosed:
+             logger.info(f"Connection closed: {session_id}")
+         finally:
+             del self.sessions[session_id]
+
+     async def run(self):
+         """Start the WebSocket server."""
+         await self.load_model()
+
+         logger.info(f"Starting WebSocket server on {self.host}:{self.port}")
+
+         async with websockets.serve(
+             self.handle_connection,
+             self.host,
+             self.port,
+             max_size=50 * 1024 * 1024,  # 50MB max message size for audio
+         ):
+             await asyncio.Future()  # Run forever
 
 
-if __name__ == "__main__":
-    main()
+ def main():
+     import argparse
+
+     parser = argparse.ArgumentParser(description="Qwen3-TTS WebSocket Server")
+     parser.add_argument(
+         "--model", "-m",
+         default=os.environ.get("QWEN3_TTS_MODEL", None),
+         help="Model path or HuggingFace repo (default: auto-detect based on VRAM, "
+              "1.7B for >=12GB, 0.6B otherwise)"
+     )
+     parser.add_argument(
+         "--device", "-d",
+         default=os.environ.get("QWEN3_TTS_DEVICE", "cuda:0"),
+         help="Device (cuda:0, cpu, etc.)"
+     )
+     parser.add_argument(
+         "--dtype",
+         default=os.environ.get("QWEN3_TTS_DTYPE", "bfloat16"),
+         help="Model dtype (bfloat16, float16, float32)"
+     )
+     parser.add_argument(
+         "--host",
+         default=os.environ.get("QWEN3_TTS_HOST", "0.0.0.0"),
+         help="Server host"
+     )
+     parser.add_argument(
+         "--port", "-p",
+         type=int,
+         default=int(os.environ.get("QWEN3_TTS_PORT", "8765")),
+         help="Server port"
+     )
+
+     args = parser.parse_args()
+
+     server = Qwen3TTSServer(
+         model_path=args.model,
+         device=args.device,
+         dtype=args.dtype,
+         host=args.host,
+         port=args.port,
+     )
+
+     asyncio.run(server.run())
+
+
+ if __name__ == "__main__":
+     main()
