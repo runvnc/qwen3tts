@@ -298,11 +298,33 @@ class Qwen3TTSServer:
             ref_text = data.get("ref_text", "")
             auto_transcribe = data.get("auto_transcribe", False)
             x_vector_only = data.get("x_vector_only", False)
+
+            # Allow init with ONLY voice_id (no audio upload) to re-bind a cached voice prompt
+            # to this *connection's* session after reconnects.
+            if not ref_audio_b64 and voice_id:
+                cached = self.get_cached_voice(voice_id)
+                if cached:
+                    logger.info(f"Using cached voice {voice_id} (voice_id-only init)")
+                    session.voice_prompt = cached
+                    session.voice_id = voice_id
+                    await websocket.send(json.dumps({
+                        "type": "ready",
+                        "voice_loaded": True,
+                        "voice_id": voice_id,
+                        "ref_text": ref_text,
+                        "cached": True
+                    }))
+                    return
+                await websocket.send(json.dumps({
+                    "type": "error",
+                    "message": f"voice_id not found in cache: {voice_id}"
+                }))
+                return
             
             if not ref_audio_b64:
                 await websocket.send(json.dumps({
                     "type": "error",
-                    "message": "ref_audio_base64 is required"
+                    "message": "ref_audio_base64 is required (or provide cached voice_id)"
                 }))
                 return
             
