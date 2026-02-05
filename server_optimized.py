@@ -443,9 +443,8 @@ class Qwen3TTSServer:
             first_chunk_time = None
             pcm_sr = 24000  # Will be updated from first chunk
             t_start = time.time()
-            is_first_chunk = True
-            all_chunks = []  # Collect all chunks first to know which is last
-            
+            chunk_index = 0
+
             # Use fork's optimized streaming
             for pcm_chunk, sr in self.model.stream_generate_voice_clone(
                 text=text,
@@ -467,28 +466,24 @@ class Qwen3TTSServer:
                 # Update sample rate from chunk
                 pcm_sr = sr
                 
-                # Collect chunks
-                all_chunks.append(pcm_chunk)
-                chunk_count += 1
-
-                await asyncio.sleep(0)
-
-            # Now process all chunks with boundary smoothing
-            for i, pcm_chunk in enumerate(all_chunks):
-                is_first = (i == 0)
-                is_last = (i == len(all_chunks) - 1)
-                
-                # Apply boundary smoothing
+                # Apply boundary smoothing (fade-in on all except first, fade-out on all)
+                # The last chunk will have unnecessary fade-out but that's fine
+                is_first = (chunk_index == 0)
                 if boundary_smooth > 0:
-                    pcm_chunk = apply_boundary_smoothing(pcm_chunk, boundary_smooth, is_first, is_last)
+                    pcm_chunk = apply_boundary_smoothing(pcm_chunk, boundary_smooth, is_first, is_last=False)
                 
-                # Convert to ulaw and send
+                # Convert to ulaw and send immediately
                 ulaw_audio = float32_to_ulaw(pcm_chunk, pcm_sr, 8000)
                 ulaw_chunks = chunk_audio(ulaw_audio, 160)
                 
                 for ulaw_chunk in ulaw_chunks:
                     await websocket.send(ulaw_chunk)
                     total_bytes += len(ulaw_chunk)
+                
+                chunk_count += 1
+                chunk_index += 1
+
+                await asyncio.sleep(0)
 
             await websocket.send(json.dumps({"type": "audio_end"}))
             profile.mark("audio_end_sent")
