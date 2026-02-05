@@ -47,6 +47,7 @@ for _name in ("qwen_tts", "transformers", "transformers.generation"):
 # Default chunk tokens
 DEFAULT_EMIT_EVERY = int(os.environ.get('QWEN3_EMIT_EVERY', '8'))
 DEFAULT_DECODE_WINDOW = int(os.environ.get('QWEN3_DECODE_WINDOW', '80'))
+DEFAULT_BUFFER_CHUNKS = int(os.environ.get('QWEN3_BUFFER_CHUNKS', '8'))
 
 # Try to import qwen_tts (should be the fork)
 try:
@@ -297,6 +298,7 @@ class Qwen3TTSServer:
         try:
             text = data.get("text", "")
             language = data.get("language", "Auto")
+            buffer_chunks = data.get("buffer_chunks", DEFAULT_BUFFER_CHUNKS)
             emit_every = data.get("emit_every_frames", DEFAULT_EMIT_EVERY)
             decode_window = data.get("decode_window_frames", DEFAULT_DECODE_WINDOW)
 
@@ -326,6 +328,7 @@ class Qwen3TTSServer:
             chunk_count = 0
             total_bytes = 0
             first_chunk_time = None
+            ulaw_buffer = b""
             t_start = time.time()
 
             # Use fork's optimized streaming
@@ -350,12 +353,24 @@ class Qwen3TTSServer:
                 ulaw_audio = float32_to_ulaw(pcm_chunk, sr, 8000)
                 ulaw_chunks = chunk_audio(ulaw_audio, 160)
 
+                # Buffer ulaw chunks before sending
                 for ulaw_chunk in ulaw_chunks:
-                    await websocket.send(ulaw_chunk)
-                    chunk_count += 1
-                    total_bytes += len(ulaw_chunk)
+                    ulaw_buffer += ulaw_chunk
+                    
+                    # Send when buffer reaches threshold
+                    if len(ulaw_buffer) >= 160 * buffer_chunks:
+                        await websocket.send(ulaw_buffer)
+                        chunk_count += len(ulaw_buffer) // 160
+                        total_bytes += len(ulaw_buffer)
+                        ulaw_buffer = b""
 
                 await asyncio.sleep(0)
+
+            # Flush remaining buffer
+            if ulaw_buffer:
+                await websocket.send(ulaw_buffer)
+                chunk_count += len(ulaw_buffer) // 160
+                total_bytes += len(ulaw_buffer)
 
             await websocket.send(json.dumps({"type": "audio_end"}))
             profile.mark("audio_end_sent")
