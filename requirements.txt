@@ -1,4 +1,5 @@
 torch>=2.0.0
+torchvision
 transformers>=4.40.0
 # Optimized fork with streaming, CUDA graphs, torch.compile support
 qwen-tts @ git+https://github.com/dffdeeq/Qwen3-TTS-streaming.git
