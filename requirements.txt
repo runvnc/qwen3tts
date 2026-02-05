@@ -1,6 +1,7 @@
 torch>=2.0.0
 transformers>=4.40.0
-qwen-tts @ git+https://github.com/QwenLM/Qwen3-TTS.git
+# Optimized fork with streaming, CUDA graphs, torch.compile support
+qwen-tts @ git+https://github.com/dffdeeq/Qwen3-TTS-streaming.git
 websockets>=12.0
 numpy
 soundfile

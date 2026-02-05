@@ -53,8 +53,11 @@ try:
     from qwen_tts import Qwen3TTSModel, VoiceClonePromptItem
     QWEN_TTS_AVAILABLE = True
     logger.info("qwen_tts imported successfully")
-except ImportError:
-    logger.warning("qwen_tts not available, running in mock mode")
+except ImportError as e:
+    logger.warning(f"qwen_tts import failed: {e}")
+    import traceback
+    traceback.print_exc()
+    logger.warning("Running in mock mode")
     QWEN_TTS_AVAILABLE = False
     Qwen3TTSModel = None
 
