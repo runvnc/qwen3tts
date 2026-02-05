@@ -66,53 +66,75 @@ except ImportError as e:
 
 
 class PCMCrossfadeBuffer:
-    """Buffer that accumulates PCM chunks with crossfade at boundaries."""
+    """Buffer that accumulates PCM chunks with crossfade at boundaries.
+    
+    The crossfade works by blending the END of one chunk with the START of the next.
+    This creates a smooth transition without losing or duplicating audio.
+    
+    For sequential (non-overlapping) chunks:
+    - Chunk 1: [A A A A T T]  (T = tail to be faded out)
+    - Chunk 2: [H H B B B B]  (H = head to be faded in)
+    - Output:  [A A A A X X B B B B]  (X = crossfaded region)
+    
+    The crossfade region replaces T and H with a blend.
+    """
     
     def __init__(self, crossfade_samples: int = 480):
         self.crossfade_samples = crossfade_samples
         self.buffer = np.array([], dtype=np.float32)
-        self.pending_chunk = None  # Chunk waiting to be crossfaded with next
+        self.prev_tail = None  # Just the tail of the previous chunk for blending
     
     def add_chunk(self, chunk: np.ndarray):
-        """Add a chunk, applying crossfade with previous chunk."""
+        """Add a chunk, applying crossfade with previous chunk's tail."""
         if self.crossfade_samples <= 0:
             # No crossfade, just accumulate
             self.buffer = np.concatenate([self.buffer, chunk])
             return
         
-        if self.pending_chunk is None:
-            # First chunk - save it, don't add to buffer yet
-            self.pending_chunk = chunk.copy()
+        if len(chunk) < self.crossfade_samples:
+            # Chunk too small for crossfade, just accumulate
+            if self.prev_tail is not None:
+                self.buffer = np.concatenate([self.buffer, self.prev_tail])
+                self.prev_tail = None
+            self.buffer = np.concatenate([self.buffer, chunk])
             return
         
-        # We have a pending chunk and a new chunk - crossfade them
-        prev = self.pending_chunk
-        curr = chunk
-        
-        if len(prev) < self.crossfade_samples or len(curr) < self.crossfade_samples:
-            # Not enough samples for crossfade, just concatenate
-            self.buffer = np.concatenate([self.buffer, prev])
-            self.pending_chunk = curr.copy()
+        if self.prev_tail is None:
+            # First chunk - output everything except tail, save tail for blending
+            self.buffer = np.concatenate([self.buffer, chunk[:-self.crossfade_samples]])
+            self.prev_tail = chunk[-self.crossfade_samples:].copy()
             return
         
+        # We have a previous tail and a new chunk - crossfade them
         # Create crossfade curves
         fade_out = np.linspace(1.0, 0.0, self.crossfade_samples, dtype=np.float32)
         fade_in = np.linspace(0.0, 1.0, self.crossfade_samples, dtype=np.float32)
         
-        # Blend the overlapping region
-        blended = prev[-self.crossfade_samples:] * fade_out + curr[:self.crossfade_samples] * fade_in
+        # Blend: prev_tail fades out, chunk head fades in
+        blended = self.prev_tail * fade_out + chunk[:self.crossfade_samples] * fade_in
         
-        # Add prev (without tail) + blended to buffer
-        self.buffer = np.concatenate([self.buffer, prev[:-self.crossfade_samples], blended])
-        
-        # Save current chunk (without head that was blended) as pending
-        self.pending_chunk = curr[self.crossfade_samples:].copy()
+        # Output: blended region + chunk middle (excluding head and tail)
+        if len(chunk) > 2 * self.crossfade_samples:
+            # Chunk has: head (blended) + middle + tail (save for next)
+            middle = chunk[self.crossfade_samples:-self.crossfade_samples]
+            self.buffer = np.concatenate([self.buffer, blended, middle])
+            self.prev_tail = chunk[-self.crossfade_samples:].copy()
+        else:
+            # Chunk is small - head overlaps with tail region
+            # Just output the blend and save what's left as tail
+            remaining = len(chunk) - self.crossfade_samples
+            if remaining > 0:
+                self.buffer = np.concatenate([self.buffer, blended])
+                self.prev_tail = chunk[-remaining:].copy() if remaining >= self.crossfade_samples else chunk[self.crossfade_samples:].copy()
+            else:
+                self.buffer = np.concatenate([self.buffer, blended])
+                self.prev_tail = None
     
     def flush(self) -> np.ndarray:
         """Flush all remaining audio and return it."""
-        if self.pending_chunk is not None and len(self.pending_chunk) > 0:
-            self.buffer = np.concatenate([self.buffer, self.pending_chunk])
-            self.pending_chunk = None
+        if self.prev_tail is not None and len(self.prev_tail) > 0:
+            self.buffer = np.concatenate([self.buffer, self.prev_tail])
+            self.prev_tail = None
         
         result = self.buffer
         self.buffer = np.array([], dtype=np.float32)
