@@ -128,7 +128,7 @@ class Qwen3TTSServer:
             model_to_load,
             device_map=self.device,
             dtype=self._get_torch_dtype(),
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
         )
 
         logger.info(f"Model loaded in {time.time() - start:.2f}s")
