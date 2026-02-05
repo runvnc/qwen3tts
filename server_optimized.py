@@ -47,7 +47,8 @@ for _name in ("qwen_tts", "transformers", "transformers.generation"):
 # Default chunk tokens
 DEFAULT_EMIT_EVERY = int(os.environ.get('QWEN3_EMIT_EVERY', '8'))
 DEFAULT_DECODE_WINDOW = int(os.environ.get('QWEN3_DECODE_WINDOW', '80'))
-DEFAULT_BUFFER_CHUNKS = int(os.environ.get('QWEN3_BUFFER_CHUNKS', '8'))
+# PCM buffer size in samples (at 24kHz). 8 frames = ~13333 samples = ~555ms
+DEFAULT_PCM_BUFFER_SAMPLES = int(os.environ.get('QWEN3_PCM_BUFFER_SAMPLES', '13333'))
 
 # Try to import qwen_tts (should be the fork)
 try:
@@ -298,7 +299,7 @@ class Qwen3TTSServer:
         try:
             text = data.get("text", "")
             language = data.get("language", "Auto")
-            buffer_chunks = data.get("buffer_chunks", DEFAULT_BUFFER_CHUNKS)
+            pcm_buffer_samples = data.get("pcm_buffer_samples", DEFAULT_PCM_BUFFER_SAMPLES)
             emit_every = data.get("emit_every_frames", DEFAULT_EMIT_EVERY)
             decode_window = data.get("decode_window_frames", DEFAULT_DECODE_WINDOW)
 
@@ -328,7 +329,8 @@ class Qwen3TTSServer:
             chunk_count = 0
             total_bytes = 0
             first_chunk_time = None
-            ulaw_buffer = b""
+            pcm_buffer = np.array([], dtype=np.float32)
+            pcm_sr = 24000  # Will be updated from first chunk
             t_start = time.time()
 
             # Use fork's optimized streaming
@@ -349,28 +351,35 @@ class Qwen3TTSServer:
                     profile.mark("first_audio_chunk")
                     logger.info(f"First chunk at {first_chunk_time*1000:.0f}ms")
 
-                # Convert to ulaw
-                ulaw_audio = float32_to_ulaw(pcm_chunk, sr, 8000)
-                ulaw_chunks = chunk_audio(ulaw_audio, 160)
-
-                # Buffer ulaw chunks before sending
-                for ulaw_chunk in ulaw_chunks:
-                    ulaw_buffer += ulaw_chunk
+                # Update sample rate from chunk
+                pcm_sr = sr
+                
+                # Accumulate PCM samples
+                pcm_buffer = np.concatenate([pcm_buffer, pcm_chunk])
+                
+                # Convert and send when buffer is large enough
+                if len(pcm_buffer) >= pcm_buffer_samples:
+                    ulaw_audio = float32_to_ulaw(pcm_buffer, pcm_sr, 8000)
+                    ulaw_chunks = chunk_audio(ulaw_audio, 160)
                     
-                    # Send when buffer reaches threshold
-                    if len(ulaw_buffer) >= 160 * buffer_chunks:
-                        await websocket.send(ulaw_buffer)
-                        chunk_count += len(ulaw_buffer) // 160
-                        total_bytes += len(ulaw_buffer)
-                        ulaw_buffer = b""
+                    for ulaw_chunk in ulaw_chunks:
+                        await websocket.send(ulaw_chunk)
+                        chunk_count += 1
+                        total_bytes += len(ulaw_chunk)
+                    
+                    pcm_buffer = np.array([], dtype=np.float32)
 
                 await asyncio.sleep(0)
 
-            # Flush remaining buffer
-            if ulaw_buffer:
-                await websocket.send(ulaw_buffer)
-                chunk_count += len(ulaw_buffer) // 160
-                total_bytes += len(ulaw_buffer)
+            # Flush remaining PCM buffer
+            if len(pcm_buffer) > 0:
+                ulaw_audio = float32_to_ulaw(pcm_buffer, pcm_sr, 8000)
+                ulaw_chunks = chunk_audio(ulaw_audio, 160)
+                
+                for ulaw_chunk in ulaw_chunks:
+                    await websocket.send(ulaw_chunk)
+                    chunk_count += 1
+                    total_bytes += len(ulaw_chunk)
 
             await websocket.send(json.dumps({"type": "audio_end"}))
             profile.mark("audio_end_sent")
