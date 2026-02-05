@@ -1,10 +1,10 @@
-\"\"\"
+"""
 Audio conversion utilities for Qwen3-TTS server.
 
 Fixed version with:
 1. Proper anti-aliased resampling (scipy.signal.resample_poly)
 2. Verified u-law encoding using standard audioop or correct numpy implementation
-\"\"\"
+"""
 
 import numpy as np
 from typing import List
@@ -25,7 +25,7 @@ except ImportError:
 
 
 def resample_audio(audio: np.ndarray, sample_rate: int, target_rate: int) -> np.ndarray:
-    \"\"\"Resample audio with proper anti-aliasing filter.
+    """Resample audio with proper anti-aliasing filter.
     
     Args:
         audio: Input audio as float32 numpy array
@@ -34,7 +34,7 @@ def resample_audio(audio: np.ndarray, sample_rate: int, target_rate: int) -> np.
     
     Returns:
         Resampled audio as float32 numpy array
-    \"\"\"
+    """
     if sample_rate == target_rate:
         return audio
     
@@ -67,16 +67,16 @@ def resample_audio(audio: np.ndarray, sample_rate: int, target_rate: int) -> np.
 
 
 def pcm16_to_ulaw_audioop(pcm16: np.ndarray) -> bytes:
-    \"\"\"Convert 16-bit PCM to u-law using audioop (verified implementation).\"\"\"
+    """Convert 16-bit PCM to u-law using audioop (verified implementation)."""
     pcm_bytes = pcm16.astype('<i2').tobytes()  # Little-endian 16-bit
     return audioop.lin2ulaw(pcm_bytes, 2)
 
 
 def pcm16_to_ulaw_numpy(pcm16: np.ndarray) -> bytes:
-    \"\"\"Convert 16-bit PCM to u-law using numpy.
+    """Convert 16-bit PCM to u-law using numpy.
     
     This is the standard ITU-T G.711 u-law encoding algorithm.
-    \"\"\"
+    """
     BIAS = 0x84  # 132
     CLIP = 32635  # Max value before clipping
     
@@ -93,15 +93,7 @@ def pcm16_to_ulaw_numpy(pcm16: np.ndarray) -> bytes:
     # Add bias
     samples = samples + BIAS
     
-    # Find the exponent (position of highest bit)
-    # For u-law, we need to find which segment the sample falls into
-    exponent = np.zeros(len(samples), dtype=np.uint8)
-    for i in range(7, 0, -1):
-        mask = samples >= (1 << (i + 7))
-        exponent = np.where(mask & (exponent == 0), i, exponent)
-    
-    # Alternative: use log2 but handle edge cases
-    # This is faster than the loop above
+    # Find the exponent using log2
     exponent = np.floor(np.log2(np.maximum(samples, 1))).astype(np.int32) - 7
     exponent = np.clip(exponent, 0, 7).astype(np.uint8)
     
@@ -115,10 +107,10 @@ def pcm16_to_ulaw_numpy(pcm16: np.ndarray) -> bytes:
 
 
 def pcm16_to_ulaw(pcm16: np.ndarray) -> bytes:
-    \"\"\"Convert 16-bit PCM to u-law.
+    """Convert 16-bit PCM to u-law.
     
     Uses audioop if available (verified), otherwise numpy implementation.
-    \"\"\"
+    """
     if AUDIOOP_AVAILABLE:
         return pcm16_to_ulaw_audioop(pcm16)
     else:
@@ -126,7 +118,7 @@ def pcm16_to_ulaw(pcm16: np.ndarray) -> bytes:
 
 
 def float32_to_ulaw(audio: np.ndarray, sample_rate: int = 24000, target_rate: int = 8000) -> bytes:
-    \"\"\"Convert float32 audio to ulaw at target sample rate.
+    """Convert float32 audio to ulaw at target sample rate.
     
     Args:
         audio: Float32 audio samples in range [-1.0, 1.0]
@@ -135,7 +127,7 @@ def float32_to_ulaw(audio: np.ndarray, sample_rate: int = 24000, target_rate: in
     
     Returns:
         u-law encoded bytes at target sample rate
-    \"\"\"
+    """
     # Resample with anti-aliasing
     if sample_rate != target_rate:
         audio = resample_audio(audio, sample_rate, target_rate)
@@ -149,7 +141,7 @@ def float32_to_ulaw(audio: np.ndarray, sample_rate: int = 24000, target_rate: in
 
 
 def chunk_audio(audio_bytes: bytes, chunk_size: int = 160) -> List[bytes]:
-    \"\"\"Split audio into chunks (160 bytes = 20ms at 8kHz ulaw).
+    """Split audio into chunks (160 bytes = 20ms at 8kHz ulaw).
     
     Args:
         audio_bytes: u-law encoded audio bytes
@@ -157,7 +149,7 @@ def chunk_audio(audio_bytes: bytes, chunk_size: int = 160) -> List[bytes]:
     
     Returns:
         List of audio chunks, last chunk padded with silence if needed
-    \"\"\"
+    """
     chunks = []
     for i in range(0, len(audio_bytes), chunk_size):
         chunk = audio_bytes[i:i + chunk_size]
