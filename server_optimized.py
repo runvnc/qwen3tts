@@ -49,6 +49,7 @@ DEFAULT_EMIT_EVERY = int(os.environ.get('QWEN3_EMIT_EVERY', '8'))
 DEFAULT_DECODE_WINDOW = int(os.environ.get('QWEN3_DECODE_WINDOW', '80'))
 # PCM buffer size in samples (at 24kHz). 8 frames = ~13333 samples = ~555ms
 DEFAULT_PCM_BUFFER_SAMPLES = int(os.environ.get('QWEN3_PCM_BUFFER_SAMPLES', '13333'))
+DEFAULT_CROSSFADE_SAMPLES = int(os.environ.get('QWEN3_CROSSFADE_SAMPLES', '480'))  # 20ms at 24kHz
 
 # Try to import qwen_tts (should be the fork)
 try:
@@ -62,6 +63,24 @@ except ImportError as e:
     logger.warning("Running in mock mode")
     QWEN_TTS_AVAILABLE = False
     Qwen3TTSModel = None
+
+
+def crossfade_chunks(prev_chunk: np.ndarray, new_chunk: np.ndarray, crossfade_samples: int) -> np.ndarray:
+    """Apply crossfade between two audio chunks to eliminate clicks."""
+    if len(prev_chunk) == 0 or crossfade_samples <= 0:
+        return new_chunk
+    
+    if len(prev_chunk) < crossfade_samples or len(new_chunk) < crossfade_samples:
+        # Not enough samples for crossfade, just concatenate
+        return new_chunk
+    
+    # Create crossfade
+    fade_out = np.linspace(1.0, 0.0, crossfade_samples, dtype=np.float32)
+    fade_in = np.linspace(0.0, 1.0, crossfade_samples, dtype=np.float32)
+    
+    # Blend the overlapping region
+    new_chunk[:crossfade_samples] = prev_chunk[-crossfade_samples:] * fade_out + new_chunk[:crossfade_samples] * fade_in
+    return new_chunk
 
 
 class Qwen3TTSServer:
@@ -300,6 +319,7 @@ class Qwen3TTSServer:
             text = data.get("text", "")
             language = data.get("language", "Auto")
             pcm_buffer_samples = data.get("pcm_buffer_samples", DEFAULT_PCM_BUFFER_SAMPLES)
+            crossfade_samples = data.get("crossfade_samples", DEFAULT_CROSSFADE_SAMPLES)
             emit_every = data.get("emit_every_frames", DEFAULT_EMIT_EVERY)
             decode_window = data.get("decode_window_frames", DEFAULT_DECODE_WINDOW)
 
@@ -331,6 +351,7 @@ class Qwen3TTSServer:
             first_chunk_time = None
             pcm_buffer = np.array([], dtype=np.float32)
             pcm_sr = 24000  # Will be updated from first chunk
+            prev_chunk_tail = None  # For crossfade
             t_start = time.time()
 
             # Use fork's optimized streaming
@@ -354,8 +375,16 @@ class Qwen3TTSServer:
                 # Update sample rate from chunk
                 pcm_sr = sr
                 
-                # Accumulate PCM samples
-                pcm_buffer = np.concatenate([pcm_buffer, pcm_chunk])
+                # Apply crossfade with previous chunk
+                if prev_chunk_tail is not None and crossfade_samples > 0:
+                    pcm_chunk = crossfade_chunks(prev_chunk_tail, pcm_chunk, crossfade_samples)
+                
+                # Save tail for next crossfade
+                if crossfade_samples > 0 and len(pcm_chunk) >= crossfade_samples:
+                    prev_chunk_tail = pcm_chunk[-crossfade_samples:].copy()
+                
+                # Accumulate PCM samples (excluding the tail we'll crossfade)
+                pcm_buffer = np.concatenate([pcm_buffer, pcm_chunk[:-crossfade_samples] if crossfade_samples > 0 and len(pcm_chunk) > crossfade_samples else pcm_chunk])
                 
                 # Convert and send when buffer is large enough
                 if len(pcm_buffer) >= pcm_buffer_samples:
@@ -373,6 +402,11 @@ class Qwen3TTSServer:
 
             # Flush remaining PCM buffer
             if len(pcm_buffer) > 0:
+                # Add the final tail
+                if prev_chunk_tail is not None:
+                    pcm_buffer = np.concatenate([pcm_buffer, prev_chunk_tail])
+                    prev_chunk_tail = None
+                
                 ulaw_audio = float32_to_ulaw(pcm_buffer, pcm_sr, 8000)
                 ulaw_chunks = chunk_audio(ulaw_audio, 160)
                 
