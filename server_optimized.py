@@ -128,8 +128,7 @@ class Qwen3TTSServer:
             model_to_load,
             device_map=self.device,
             dtype=self._get_torch_dtype(),
-            # Use SDPA (PyTorch native) - flash_attention_2 has binary compatibility issues
-            attn_implementation="sdpa",
+            attn_implementation="flash_attention_2",
         )
 
         logger.info(f"Model loaded in {time.time() - start:.2f}s")
