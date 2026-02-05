@@ -45,11 +45,12 @@ for _name in ("qwen_tts", "transformers", "transformers.generation"):
     logging.getLogger(_name).setLevel(logging.WARNING)
 
 # Default chunk tokens
-DEFAULT_EMIT_EVERY = int(os.environ.get('QWEN3_EMIT_EVERY', '8'))
+DEFAULT_EMIT_EVERY = int(os.environ.get('QWEN3_EMIT_EVERY', '2'))
 DEFAULT_DECODE_WINDOW = int(os.environ.get('QWEN3_DECODE_WINDOW', '80'))
 # PCM buffer size in samples (at 24kHz). 8 frames = ~13333 samples = ~555ms
 DEFAULT_PCM_BUFFER_SAMPLES = int(os.environ.get('QWEN3_PCM_BUFFER_SAMPLES', '13333'))
-DEFAULT_CROSSFADE_SAMPLES = int(os.environ.get('QWEN3_CROSSFADE_SAMPLES', '480'))  # 20ms at 24kHz
+DEFAULT_CROSSFADE_SAMPLES = int(os.environ.get('QWEN3_CROSSFADE_SAMPLES', '0'))  # Old crossfade, disabled
+DEFAULT_BOUNDARY_SMOOTH_SAMPLES = int(os.environ.get('QWEN3_BOUNDARY_SMOOTH', '30'))  # Boundary smoothing
 
 # Try to import qwen_tts (should be the fork)
 try:
@@ -63,6 +64,30 @@ except ImportError as e:
     logger.warning("Running in mock mode")
     QWEN_TTS_AVAILABLE = False
     Qwen3TTSModel = None
+
+
+def apply_boundary_smoothing(chunk: np.ndarray, smooth_samples: int, is_first: bool, is_last: bool) -> np.ndarray:
+    """Apply gentle amplitude smoothing at chunk boundaries to reduce clicks.
+    
+    Unlike crossfade, this doesn't blend or lose audio - it just reduces
+    the amplitude slightly at boundaries to soften discontinuities.
+    """
+    if smooth_samples <= 0 or len(chunk) < smooth_samples * 2:
+        return chunk
+    
+    chunk = chunk.copy()  # Don't modify original
+    
+    # Fade in at start (unless first chunk)
+    if not is_first:
+        fade_in = np.linspace(0.7, 1.0, smooth_samples, dtype=np.float32)
+        chunk[:smooth_samples] *= fade_in
+    
+    # Fade out at end (unless last chunk)
+    if not is_last:
+        fade_out = np.linspace(1.0, 0.7, smooth_samples, dtype=np.float32)
+        chunk[-smooth_samples:] *= fade_out
+    
+    return chunk
 
 
 class PCMCrossfadeBuffer:
@@ -388,6 +413,7 @@ class Qwen3TTSServer:
             crossfade_samples = data.get("crossfade_samples", DEFAULT_CROSSFADE_SAMPLES)
             emit_every = data.get("emit_every_frames", DEFAULT_EMIT_EVERY)
             decode_window = data.get("decode_window_frames", DEFAULT_DECODE_WINDOW)
+            boundary_smooth = data.get("boundary_smooth", DEFAULT_BOUNDARY_SMOOTH_SAMPLES)
 
             profile.mark("params_parsed")
             logger.info(f"generate_stream: text='{text[:50]}...' emit={emit_every} crossfade={crossfade_samples}")
@@ -417,10 +443,9 @@ class Qwen3TTSServer:
             first_chunk_time = None
             pcm_sr = 24000  # Will be updated from first chunk
             t_start = time.time()
+            is_first_chunk = True
+            all_chunks = []  # Collect all chunks first to know which is last
             
-            # Use crossfade buffer for smooth chunk boundaries
-            pcm_buffer = PCMCrossfadeBuffer(crossfade_samples=crossfade_samples)
-
             # Use fork's optimized streaming
             for pcm_chunk, sr in self.model.stream_generate_voice_clone(
                 text=text,
@@ -442,31 +467,27 @@ class Qwen3TTSServer:
                 # Update sample rate from chunk
                 pcm_sr = sr
                 
-                # Add chunk to crossfade buffer
-                pcm_buffer.add_chunk(pcm_chunk)
-                
-                # Convert and send when buffer is large enough
-                ready_pcm = pcm_buffer.get_and_clear(pcm_buffer_samples)
-                if ready_pcm is not None:
-                    ulaw_audio = float32_to_ulaw(ready_pcm, pcm_sr, 8000)
-                    ulaw_chunks = chunk_audio(ulaw_audio, 160)
-                    
-                    for ulaw_chunk in ulaw_chunks:
-                        await websocket.send(ulaw_chunk)
-                        chunk_count += 1
-                        total_bytes += len(ulaw_chunk)
+                # Collect chunks
+                all_chunks.append(pcm_chunk)
+                chunk_count += 1
 
                 await asyncio.sleep(0)
 
-            # Flush remaining PCM buffer
-            final_pcm = pcm_buffer.flush()
-            if len(final_pcm) > 0:
-                ulaw_audio = float32_to_ulaw(final_pcm, pcm_sr, 8000)
+            # Now process all chunks with boundary smoothing
+            for i, pcm_chunk in enumerate(all_chunks):
+                is_first = (i == 0)
+                is_last = (i == len(all_chunks) - 1)
+                
+                # Apply boundary smoothing
+                if boundary_smooth > 0:
+                    pcm_chunk = apply_boundary_smoothing(pcm_chunk, boundary_smooth, is_first, is_last)
+                
+                # Convert to ulaw and send
+                ulaw_audio = float32_to_ulaw(pcm_chunk, pcm_sr, 8000)
                 ulaw_chunks = chunk_audio(ulaw_audio, 160)
                 
                 for ulaw_chunk in ulaw_chunks:
                     await websocket.send(ulaw_chunk)
-                    chunk_count += 1
                     total_bytes += len(ulaw_chunk)
 
             await websocket.send(json.dumps({"type": "audio_end"}))
