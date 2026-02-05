@@ -50,7 +50,6 @@ DEFAULT_DECODE_WINDOW = int(os.environ.get('QWEN3_DECODE_WINDOW', '80'))
 # PCM buffer size in samples (at 24kHz). 8 frames = ~13333 samples = ~555ms
 DEFAULT_PCM_BUFFER_SAMPLES = int(os.environ.get('QWEN3_PCM_BUFFER_SAMPLES', '13333'))
 DEFAULT_CROSSFADE_SAMPLES = int(os.environ.get('QWEN3_CROSSFADE_SAMPLES', '480'))  # 20ms at 24kHz
-DEFAULT_OVERLAP_SAMPLES = int(os.environ.get('QWEN3_OVERLAP_SAMPLES', '2048'))  # Model decoder overlap
 
 # Try to import qwen_tts (should be the fork)
 try:
@@ -389,7 +388,6 @@ class Qwen3TTSServer:
             crossfade_samples = data.get("crossfade_samples", DEFAULT_CROSSFADE_SAMPLES)
             emit_every = data.get("emit_every_frames", DEFAULT_EMIT_EVERY)
             decode_window = data.get("decode_window_frames", DEFAULT_DECODE_WINDOW)
-            overlap_samples = data.get("overlap_samples", DEFAULT_OVERLAP_SAMPLES)
 
             profile.mark("params_parsed")
             logger.info(f"generate_stream: text='{text[:50]}...' emit={emit_every} crossfade={crossfade_samples}")
@@ -430,7 +428,8 @@ class Qwen3TTSServer:
                 voice_clone_prompt=session.voice_prompt,
                 emit_every_frames=emit_every,
                 decode_window_frames=decode_window,
-                overlap_samples=overlap_samples,
+                overlap_samples=512,
+                overlap_samples=512,
             ):
                 if session.cancel_requested:
                     logger.info("Generation cancelled")
