@@ -429,7 +429,6 @@ class Qwen3TTSServer:
                 emit_every_frames=emit_every,
                 decode_window_frames=decode_window,
                 overlap_samples=512,
-                overlap_samples=512,
             ):
                 if session.cancel_requested:
                     logger.info("Generation cancelled")
