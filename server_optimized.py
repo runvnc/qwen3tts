@@ -65,22 +65,66 @@ except ImportError as e:
     Qwen3TTSModel = None
 
 
-def crossfade_chunks(prev_chunk: np.ndarray, new_chunk: np.ndarray, crossfade_samples: int) -> np.ndarray:
-    """Apply crossfade between two audio chunks to eliminate clicks."""
-    if len(prev_chunk) == 0 or crossfade_samples <= 0:
-        return new_chunk
+class PCMCrossfadeBuffer:
+    """Buffer that accumulates PCM chunks with crossfade at boundaries."""
     
-    if len(prev_chunk) < crossfade_samples or len(new_chunk) < crossfade_samples:
-        # Not enough samples for crossfade, just concatenate
-        return new_chunk
+    def __init__(self, crossfade_samples: int = 480):
+        self.crossfade_samples = crossfade_samples
+        self.buffer = np.array([], dtype=np.float32)
+        self.pending_chunk = None  # Chunk waiting to be crossfaded with next
     
-    # Create crossfade
-    fade_out = np.linspace(1.0, 0.0, crossfade_samples, dtype=np.float32)
-    fade_in = np.linspace(0.0, 1.0, crossfade_samples, dtype=np.float32)
+    def add_chunk(self, chunk: np.ndarray):
+        """Add a chunk, applying crossfade with previous chunk."""
+        if self.crossfade_samples <= 0:
+            # No crossfade, just accumulate
+            self.buffer = np.concatenate([self.buffer, chunk])
+            return
+        
+        if self.pending_chunk is None:
+            # First chunk - save it, don't add to buffer yet
+            self.pending_chunk = chunk.copy()
+            return
+        
+        # We have a pending chunk and a new chunk - crossfade them
+        prev = self.pending_chunk
+        curr = chunk
+        
+        if len(prev) < self.crossfade_samples or len(curr) < self.crossfade_samples:
+            # Not enough samples for crossfade, just concatenate
+            self.buffer = np.concatenate([self.buffer, prev])
+            self.pending_chunk = curr.copy()
+            return
+        
+        # Create crossfade curves
+        fade_out = np.linspace(1.0, 0.0, self.crossfade_samples, dtype=np.float32)
+        fade_in = np.linspace(0.0, 1.0, self.crossfade_samples, dtype=np.float32)
+        
+        # Blend the overlapping region
+        blended = prev[-self.crossfade_samples:] * fade_out + curr[:self.crossfade_samples] * fade_in
+        
+        # Add prev (without tail) + blended to buffer
+        self.buffer = np.concatenate([self.buffer, prev[:-self.crossfade_samples], blended])
+        
+        # Save current chunk (without head that was blended) as pending
+        self.pending_chunk = curr[self.crossfade_samples:].copy()
     
-    # Blend the overlapping region
-    new_chunk[:crossfade_samples] = prev_chunk[-crossfade_samples:] * fade_out + new_chunk[:crossfade_samples] * fade_in
-    return new_chunk
+    def flush(self) -> np.ndarray:
+        """Flush all remaining audio and return it."""
+        if self.pending_chunk is not None and len(self.pending_chunk) > 0:
+            self.buffer = np.concatenate([self.buffer, self.pending_chunk])
+            self.pending_chunk = None
+        
+        result = self.buffer
+        self.buffer = np.array([], dtype=np.float32)
+        return result
+    
+    def get_and_clear(self, min_samples: int) -> Optional[np.ndarray]:
+        """Get buffer contents if >= min_samples, clearing the buffer."""
+        if len(self.buffer) >= min_samples:
+            result = self.buffer
+            self.buffer = np.array([], dtype=np.float32)
+            return result
+        return None
 
 
 class Qwen3TTSServer:
@@ -324,7 +368,7 @@ class Qwen3TTSServer:
             decode_window = data.get("decode_window_frames", DEFAULT_DECODE_WINDOW)
 
             profile.mark("params_parsed")
-            logger.info(f"generate_stream: text='{text[:50]}...' emit={emit_every} window={decode_window}")
+            logger.info(f"generate_stream: text='{text[:50]}...' emit={emit_every} crossfade={crossfade_samples}")
 
             if not text:
                 await websocket.send(json.dumps({"type": "error", "message": "text required"}))
@@ -349,10 +393,11 @@ class Qwen3TTSServer:
             chunk_count = 0
             total_bytes = 0
             first_chunk_time = None
-            pcm_buffer = np.array([], dtype=np.float32)
             pcm_sr = 24000  # Will be updated from first chunk
-            prev_chunk_tail = None  # For crossfade
             t_start = time.time()
+            
+            # Use crossfade buffer for smooth chunk boundaries
+            pcm_buffer = PCMCrossfadeBuffer(crossfade_samples=crossfade_samples)
 
             # Use fork's optimized streaming
             for pcm_chunk, sr in self.model.stream_generate_voice_clone(
@@ -375,39 +420,26 @@ class Qwen3TTSServer:
                 # Update sample rate from chunk
                 pcm_sr = sr
                 
-                # Apply crossfade with previous chunk
-                if prev_chunk_tail is not None and crossfade_samples > 0:
-                    pcm_chunk = crossfade_chunks(prev_chunk_tail, pcm_chunk, crossfade_samples)
-                
-                # Save tail for next crossfade
-                if crossfade_samples > 0 and len(pcm_chunk) >= crossfade_samples:
-                    prev_chunk_tail = pcm_chunk[-crossfade_samples:].copy()
-                
-                # Accumulate PCM samples (excluding the tail we'll crossfade)
-                pcm_buffer = np.concatenate([pcm_buffer, pcm_chunk[:-crossfade_samples] if crossfade_samples > 0 and len(pcm_chunk) > crossfade_samples else pcm_chunk])
+                # Add chunk to crossfade buffer
+                pcm_buffer.add_chunk(pcm_chunk)
                 
                 # Convert and send when buffer is large enough
-                if len(pcm_buffer) >= pcm_buffer_samples:
-                    ulaw_audio = float32_to_ulaw(pcm_buffer, pcm_sr, 8000)
+                ready_pcm = pcm_buffer.get_and_clear(pcm_buffer_samples)
+                if ready_pcm is not None:
+                    ulaw_audio = float32_to_ulaw(ready_pcm, pcm_sr, 8000)
                     ulaw_chunks = chunk_audio(ulaw_audio, 160)
                     
                     for ulaw_chunk in ulaw_chunks:
                         await websocket.send(ulaw_chunk)
                         chunk_count += 1
                         total_bytes += len(ulaw_chunk)
-                    
-                    pcm_buffer = np.array([], dtype=np.float32)
 
                 await asyncio.sleep(0)
 
             # Flush remaining PCM buffer
-            if len(pcm_buffer) > 0:
-                # Add the final tail
-                if prev_chunk_tail is not None:
-                    pcm_buffer = np.concatenate([pcm_buffer, prev_chunk_tail])
-                    prev_chunk_tail = None
-                
-                ulaw_audio = float32_to_ulaw(pcm_buffer, pcm_sr, 8000)
+            final_pcm = pcm_buffer.flush()
+            if len(final_pcm) > 0:
+                ulaw_audio = float32_to_ulaw(final_pcm, pcm_sr, 8000)
                 ulaw_chunks = chunk_audio(ulaw_audio, 160)
                 
                 for ulaw_chunk in ulaw_chunks:
