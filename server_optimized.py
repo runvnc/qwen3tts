@@ -2,7 +2,7 @@
 """
 Qwen3-TTS WebSocket Streaming Server - Optimized Version
 
-Uses the dffdeeq fork's optimizations for ~3x speedup.
+Uses the dffdeeq fork's optimizations for ~3x speedup + click-free audio pipeline.
 Requires: pip install -e /path/to/Qwen3-TTS-streaming
 """
 
@@ -23,7 +23,7 @@ import websockets
 from websockets.server import WebSocketServerProtocol
 
 # Local imports
-from audio_utils import float32_to_ulaw, chunk_audio
+from audio_utils import float32_to_ulaw, chunk_audio, StreamingAntiAliasFilter, BoundaryClickRepair
 from voice_cache import VoiceCache
 from session import VoiceSession
 from transcription import (
@@ -47,10 +47,8 @@ for _name in ("qwen_tts", "transformers", "transformers.generation"):
 # Default chunk tokens
 DEFAULT_EMIT_EVERY = int(os.environ.get('QWEN3_EMIT_EVERY', '2'))
 DEFAULT_DECODE_WINDOW = int(os.environ.get('QWEN3_DECODE_WINDOW', '80'))
-# PCM buffer size in samples (at 24kHz). 8 frames = ~13333 samples = ~555ms
-DEFAULT_PCM_BUFFER_SAMPLES = int(os.environ.get('QWEN3_PCM_BUFFER_SAMPLES', '13333'))
-DEFAULT_CROSSFADE_SAMPLES = int(os.environ.get('QWEN3_CROSSFADE_SAMPLES', '0'))  # Old crossfade, disabled
-DEFAULT_BOUNDARY_SMOOTH_SAMPLES = int(os.environ.get('QWEN3_BOUNDARY_SMOOTH', '30'))  # Boundary smoothing
+# Click repair threshold (amplitude jump that triggers interpolation)
+DEFAULT_CLICK_THRESHOLD = float(os.environ.get('QWEN3_CLICK_THRESHOLD', '0.15'))
 
 # Try to import qwen_tts (should be the fork)
 try:
@@ -64,114 +62,6 @@ except ImportError as e:
     logger.warning("Running in mock mode")
     QWEN_TTS_AVAILABLE = False
     Qwen3TTSModel = None
-
-
-def apply_boundary_smoothing(chunk: np.ndarray, smooth_samples: int, is_first: bool, is_last: bool) -> np.ndarray:
-    """Apply gentle amplitude smoothing at chunk boundaries to reduce clicks.
-    
-    Unlike crossfade, this doesn't blend or lose audio - it just reduces
-    the amplitude slightly at boundaries to soften discontinuities.
-    """
-    if smooth_samples <= 0 or len(chunk) < smooth_samples * 2:
-        return chunk
-    
-    chunk = chunk.copy()  # Don't modify original
-    
-    # Fade in at start (unless first chunk)
-    if not is_first:
-        fade_in = np.linspace(0.7, 1.0, smooth_samples, dtype=np.float32)
-        chunk[:smooth_samples] *= fade_in
-    
-    # Fade out at end (unless last chunk)
-    if not is_last:
-        fade_out = np.linspace(1.0, 0.7, smooth_samples, dtype=np.float32)
-        chunk[-smooth_samples:] *= fade_out
-    
-    return chunk
-
-
-class PCMCrossfadeBuffer:
-    """Buffer that accumulates PCM chunks with crossfade at boundaries.
-    
-    The crossfade works by blending the END of one chunk with the START of the next.
-    This creates a smooth transition without losing or duplicating audio.
-    
-    For sequential (non-overlapping) chunks:
-    - Chunk 1: [A A A A T T]  (T = tail to be faded out)
-    - Chunk 2: [H H B B B B]  (H = head to be faded in)
-    - Output:  [A A A A X X B B B B]  (X = crossfaded region)
-    
-    The crossfade region replaces T and H with a blend.
-    """
-    
-    def __init__(self, crossfade_samples: int = 480):
-        self.crossfade_samples = crossfade_samples
-        self.buffer = np.array([], dtype=np.float32)
-        self.prev_tail = None  # Just the tail of the previous chunk for blending
-    
-    def add_chunk(self, chunk: np.ndarray):
-        """Add a chunk, applying crossfade with previous chunk's tail."""
-        if self.crossfade_samples <= 0:
-            # No crossfade, just accumulate
-            self.buffer = np.concatenate([self.buffer, chunk])
-            return
-        
-        if len(chunk) < self.crossfade_samples:
-            # Chunk too small for crossfade, just accumulate
-            if self.prev_tail is not None:
-                self.buffer = np.concatenate([self.buffer, self.prev_tail])
-                self.prev_tail = None
-            self.buffer = np.concatenate([self.buffer, chunk])
-            return
-        
-        if self.prev_tail is None:
-            # First chunk - output everything except tail, save tail for blending
-            self.buffer = np.concatenate([self.buffer, chunk[:-self.crossfade_samples]])
-            self.prev_tail = chunk[-self.crossfade_samples:].copy()
-            return
-        
-        # We have a previous tail and a new chunk - crossfade them
-        # Create crossfade curves
-        fade_out = np.linspace(1.0, 0.0, self.crossfade_samples, dtype=np.float32)
-        fade_in = np.linspace(0.0, 1.0, self.crossfade_samples, dtype=np.float32)
-        
-        # Blend: prev_tail fades out, chunk head fades in
-        blended = self.prev_tail * fade_out + chunk[:self.crossfade_samples] * fade_in
-        
-        # Output: blended region + chunk middle (excluding head and tail)
-        if len(chunk) > 2 * self.crossfade_samples:
-            # Chunk has: head (blended) + middle + tail (save for next)
-            middle = chunk[self.crossfade_samples:-self.crossfade_samples]
-            self.buffer = np.concatenate([self.buffer, blended, middle])
-            self.prev_tail = chunk[-self.crossfade_samples:].copy()
-        else:
-            # Chunk is small - head overlaps with tail region
-            # Just output the blend and save what's left as tail
-            remaining = len(chunk) - self.crossfade_samples
-            if remaining > 0:
-                self.buffer = np.concatenate([self.buffer, blended])
-                self.prev_tail = chunk[-remaining:].copy() if remaining >= self.crossfade_samples else chunk[self.crossfade_samples:].copy()
-            else:
-                self.buffer = np.concatenate([self.buffer, blended])
-                self.prev_tail = None
-    
-    def flush(self) -> np.ndarray:
-        """Flush all remaining audio and return it."""
-        if self.prev_tail is not None and len(self.prev_tail) > 0:
-            self.buffer = np.concatenate([self.buffer, self.prev_tail])
-            self.prev_tail = None
-        
-        result = self.buffer
-        self.buffer = np.array([], dtype=np.float32)
-        return result
-    
-    def get_and_clear(self, min_samples: int) -> Optional[np.ndarray]:
-        """Get buffer contents if >= min_samples, clearing the buffer."""
-        if len(self.buffer) >= min_samples:
-            result = self.buffer
-            self.buffer = np.array([], dtype=np.float32)
-            return result
-        return None
 
 
 class Qwen3TTSServer:
@@ -197,7 +87,7 @@ class Qwen3TTSServer:
         self.sessions: Dict[str, VoiceSession] = {}
         self.voice_cache = VoiceCache(max_voices=50)
         
-        logger.info(f"Server config: emit_every={DEFAULT_EMIT_EVERY}, decode_window={DEFAULT_DECODE_WINDOW}")
+        logger.info(f"Server config: emit_every={DEFAULT_EMIT_EVERY}, decode_window={DEFAULT_DECODE_WINDOW}, click_threshold={DEFAULT_CLICK_THRESHOLD}")
 
     def _get_torch_dtype(self) -> torch.dtype:
         dtype_map = {
@@ -403,20 +293,17 @@ class Qwen3TTSServer:
         session: VoiceSession,
         data: Dict[str, Any]
     ):
-        """Generate audio with fork's optimized streaming."""
+        """Generate audio with fork's optimized streaming + click-free pipeline."""
         profile = profiler.start(f"stream_{id(websocket)}")
         
         try:
             text = data.get("text", "")
             language = data.get("language", "Auto")
-            pcm_buffer_samples = data.get("pcm_buffer_samples", DEFAULT_PCM_BUFFER_SAMPLES)
-            crossfade_samples = data.get("crossfade_samples", DEFAULT_CROSSFADE_SAMPLES)
             emit_every = data.get("emit_every_frames", DEFAULT_EMIT_EVERY)
             decode_window = data.get("decode_window_frames", DEFAULT_DECODE_WINDOW)
-            boundary_smooth = data.get("boundary_smooth", DEFAULT_BOUNDARY_SMOOTH_SAMPLES)
 
             profile.mark("params_parsed")
-            logger.info(f"generate_stream: text='{text[:50]}...' emit={emit_every} crossfade={crossfade_samples}")
+            logger.info(f"generate_stream: text='{text[:50]}...' emit={emit_every}")
 
             if not text:
                 await websocket.send(json.dumps({"type": "error", "message": "text required"}))
@@ -437,6 +324,10 @@ class Qwen3TTSServer:
 
             await websocket.send(json.dumps({"type": "audio_start"}))
             profile.mark("audio_start_sent")
+
+            # Create per-utterance audio processing pipeline
+            aa_filter = StreamingAntiAliasFilter()
+            click_repair = BoundaryClickRepair(threshold=DEFAULT_CLICK_THRESHOLD)
 
             chunk_count = 0
             total_bytes = 0
@@ -466,12 +357,12 @@ class Qwen3TTSServer:
                 # Update sample rate from chunk
                 pcm_sr = sr
                 
-                # Apply boundary smoothing (fade-in on all except first, fade-out on all)
-                # The last chunk will have unnecessary fade-out but that's fine
-                is_first = (chunk_index == 0)
-                if boundary_smooth > 0:
-                    pcm_chunk = apply_boundary_smoothing(pcm_chunk, boundary_smooth, is_first, is_last=False)
-                
+                # Audio processing pipeline:
+                # 1) Repair clicks at chunk boundaries (interpolation)
+                pcm_chunk = click_repair.process(pcm_chunk)
+                # 2) Anti-aliasing LPF (streaming, maintains state across chunks)
+                pcm_chunk = aa_filter.process(pcm_chunk)
+
                 # Convert to ulaw and send immediately
                 ulaw_audio = float32_to_ulaw(pcm_chunk, pcm_sr, 8000)
                 ulaw_chunks = chunk_audio(ulaw_audio, 160)
