@@ -74,6 +74,28 @@ except ImportError as e:
     Qwen3TTSModel = None
 
 
+async def async_iter_sync_gen(sync_gen):
+    """Wrap a synchronous generator to run in a thread pool.
+    
+    Each next() call runs in the default executor, freeing the event loop
+    to handle pings, cancel messages, and other connections between chunks.
+    """
+    loop = asyncio.get_event_loop()
+    it = iter(sync_gen)
+    
+    def _next():
+        try:
+            return (False, next(it))
+        except StopIteration:
+            return (True, None)
+    
+    while True:
+        done, value = await loop.run_in_executor(None, _next)
+        if done:
+            break
+        yield value
+
+
 class Qwen3TTSServer:
     """WebSocket server for Qwen3-TTS streaming with fork optimizations."""
 
@@ -347,14 +369,15 @@ class Qwen3TTSServer:
             chunk_index = 0
 
             # Use fork's optimized streaming
-            for pcm_chunk, sr in self.model.stream_generate_voice_clone(
+            sync_gen = self.model.stream_generate_voice_clone(
                 text=text,
                 language=language,
                 voice_clone_prompt=session.voice_prompt,
                 emit_every_frames=emit_every,
                 decode_window_frames=decode_window,
                 overlap_samples=512,
-            ):
+            )
+            async for pcm_chunk, sr in async_iter_sync_gen(sync_gen):
                 if session.cancel_requested:
                     logger.info("Generation cancelled")
                     break
