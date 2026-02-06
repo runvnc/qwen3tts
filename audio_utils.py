@@ -4,6 +4,7 @@ Audio conversion utilities for Qwen3-TTS server.
 Includes:
 - Proper anti-aliasing low-pass filter before downsampling (kills click energy)
 - Boundary click detection and repair
+- Stateful streaming resampler (maintains ratecv state across chunks)
 - Standard ulaw conversion
 
 The key insight: clicks are broadband impulses. Since we downsample to 8kHz
@@ -13,7 +14,7 @@ mediocre built-in filter misses.
 
 import numpy as np
 import audioop
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from scipy.signal import butter, sosfilt, sosfiltfilt
 
 # Pre-compute the anti-aliasing filter coefficients (done once at import time)
@@ -106,11 +107,57 @@ class BoundaryClickRepair:
         self._prev_tail = None
 
 
+class StreamingResampler:
+    """Stateful resampler that maintains audioop.ratecv state across chunks.
+    
+    This prevents click artifacts at chunk boundaries during resampling
+    by carrying the internal filter state from one chunk to the next.
+    """
+    
+    def __init__(self, source_rate: int = 24000, target_rate: int = 8000):
+        self.source_rate = source_rate
+        self.target_rate = target_rate
+        self._ratecv_state = None
+    
+    def process(self, audio: np.ndarray) -> bytes:
+        """Resample a float32 audio chunk to ulaw bytes, maintaining state.
+        
+        Args:
+            audio: Float32 audio samples in range [-1.0, 1.0]
+        
+        Returns:
+            u-law encoded bytes at target sample rate
+        """
+        if len(audio) == 0:
+            return b''
+        
+        # Convert float32 to 16-bit PCM bytes
+        audio = np.clip(audio, -1.0, 1.0)
+        pcm16 = (audio * 32767).astype(np.int16)
+        pcm_bytes = pcm16.tobytes()
+        
+        # Resample with state
+        if self.source_rate != self.target_rate:
+            pcm_bytes, self._ratecv_state = audioop.ratecv(
+                pcm_bytes, 2, 1,
+                self.source_rate, self.target_rate,
+                self._ratecv_state
+            )
+        
+        # Convert to ulaw
+        return audioop.lin2ulaw(pcm_bytes, 2)
+    
+    def reset(self):
+        """Reset resampler state (call between utterances)."""
+        self._ratecv_state = None
+
+
 def float32_to_ulaw(audio: np.ndarray, sample_rate: int = 24000,
                     target_rate: int = 8000) -> bytes:
     """Convert float32 audio to ulaw at target sample rate.
     
-    Uses audioop.ratecv for resampling (same approach as mr_pocket_tts).
+    NOTE: This is stateless - each call resamples independently.
+    For streaming use, prefer StreamingResampler which maintains state.
     
     Args:
         audio: Float32 audio samples in range [-1.0, 1.0]
@@ -125,7 +172,7 @@ def float32_to_ulaw(audio: np.ndarray, sample_rate: int = 24000,
     pcm16 = (audio * 32767).astype(np.int16)
     pcm_bytes = pcm16.tobytes()
     
-    # Resample using audioop.ratecv (same as mr_pocket_tts)
+    # Resample using audioop.ratecv (stateless)
     if sample_rate != target_rate:
         pcm_bytes, _ = audioop.ratecv(pcm_bytes, 2, 1, sample_rate, target_rate, None)
     

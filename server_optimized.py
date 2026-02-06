@@ -23,7 +23,7 @@ import websockets
 from websockets.server import WebSocketServerProtocol
 
 # Local imports
-from audio_utils import float32_to_ulaw, chunk_audio, StreamingAntiAliasFilter, BoundaryClickRepair
+from audio_utils import float32_to_ulaw, chunk_audio, StreamingAntiAliasFilter, BoundaryClickRepair, StreamingResampler
 from voice_cache import VoiceCache
 from session import VoiceSession
 
@@ -360,6 +360,7 @@ class Qwen3TTSServer:
             # Create per-utterance audio processing pipeline
             aa_filter = StreamingAntiAliasFilter()
             click_repair = BoundaryClickRepair(threshold=DEFAULT_CLICK_THRESHOLD)
+            resampler = StreamingResampler(source_rate=24000, target_rate=8000)
 
             chunk_count = 0
             total_bytes = 0
@@ -397,8 +398,8 @@ class Qwen3TTSServer:
                 pcm_chunk = aa_filter.process(pcm_chunk)
 
                 # Convert to ulaw and send immediately
-                ulaw_audio = float32_to_ulaw(pcm_chunk, pcm_sr, 8000)
-                ulaw_chunks = chunk_audio(ulaw_audio, 160)
+                ulaw_bytes = resampler.process(pcm_chunk)
+                ulaw_chunks = chunk_audio(ulaw_bytes, 160)
                 
                 for ulaw_chunk in ulaw_chunks:
                     await websocket.send(ulaw_chunk)
