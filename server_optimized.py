@@ -26,6 +26,16 @@ from websockets.server import WebSocketServerProtocol
 from audio_utils import float32_to_ulaw, chunk_audio, StreamingAntiAliasFilter, BoundaryClickRepair
 from voice_cache import VoiceCache
 from session import VoiceSession
+
+# Detect flash-attention availability
+try:
+    import flash_attn
+    ATTN_IMPL = "flash_attention_2"
+    logging.getLogger(__name__).info(f"flash-attn {flash_attn.__version__} found, using flash_attention_2")
+except ImportError:
+    ATTN_IMPL = "sdpa"
+    logging.getLogger(__name__).info("flash-attn not found, falling back to sdpa")
+
 from transcription import (
     WHISPER_AVAILABLE, 
     transcribe_audio, 
@@ -130,7 +140,7 @@ class Qwen3TTSServer:
             model_to_load,
             device_map=self.device,
             dtype=self._get_torch_dtype(),
-            attn_implementation="sdpa",
+            attn_implementation=ATTN_IMPL,
         )
 
         logger.info(f"Model loaded in {time.time() - start:.2f}s")

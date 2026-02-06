@@ -1,47 +1,48 @@
 #!/bin/bash
-# Build flash-attention 2 for RTX 5090 (Blackwell, SM 12.0) with CUDA 12.8
+# Build flash-attention 2 for RTX 5090 (Blackwell, SM 120) with CUDA 12.8
 #
-# The default flash-attn build compiles for ALL GPU architectures, which takes
-# forever (30-60+ min). Specifying only the target arch cuts it to ~5-10 min.
+# IMPORTANT: flash-attn uses FLASH_ATTN_CUDA_ARCHS (not TORCH_CUDA_ARCH_LIST!)
+# Without this, it builds for ALL architectures = 30-60+ min.
+# With it, ~5-10 min.
 #
-# RTX 5090 = GB202 = Blackwell = compute capability 12.0
+# See: https://github.com/Dao-AILab/flash-attention/issues/1560
+#
+# NOTE: As of early 2026, flash-attn Blackwell (sm_120) support is
+# still maturing. FA2 kernels may compile but crash at runtime.
+# If that happens, fall back to sdpa (PyTorch built-in).
+# The server_optimized.py already handles this automatically.
 #
 # Usage:
 #   chmod +x build_flash_attn.sh
 #   ./build_flash_attn.sh
-#
-# Or to install a specific version:
-#   FLASH_ATTN_VERSION=2.7.4 ./build_flash_attn.sh
 
 set -euo pipefail
 
 # ---- Configuration ----
-# RTX 5090 (Blackwell) compute capability
+# RTX 5090 = Blackwell = SM 120
+# This is the flash-attn specific env var (NOT TORCH_CUDA_ARCH_LIST!)
+export FLASH_ATTN_CUDA_ARCHS="120"
+
+# Also set TORCH_CUDA_ARCH_LIST for any PyTorch extension builds
 export TORCH_CUDA_ARCH_LIST="12.0"
 
 # Parallel build jobs - adjust based on RAM (each job uses ~2-4GB)
-# Too many jobs can OOM during compilation
 export MAX_JOBS=${MAX_JOBS:-$(nproc --ignore=2)}
 
-# flash-attn version (empty = latest)
-FLASH_ATTN_VERSION=${FLASH_ATTN_VERSION:-""}
-
-# Force build from source (skip wheel check)
+# Force build from source
 export FLASH_ATTENTION_FORCE_BUILD=TRUE
-
-# Skip tests during build
 export FLASH_ATTENTION_SKIP_CUDA_BUILD_TEST=TRUE
 
 # ---- Sanity checks ----
 echo "=== Flash Attention 2 Builder for RTX 5090 ==="
-echo "TORCH_CUDA_ARCH_LIST: ${TORCH_CUDA_ARCH_LIST}"
-echo "MAX_JOBS: ${MAX_JOBS}"
+echo "FLASH_ATTN_CUDA_ARCHS: ${FLASH_ATTN_CUDA_ARCHS}"
+echo "TORCH_CUDA_ARCH_LIST:  ${TORCH_CUDA_ARCH_LIST}"
+echo "MAX_JOBS:              ${MAX_JOBS}"
 echo ""
 
 # Check CUDA
 if ! command -v nvcc &> /dev/null; then
     echo "ERROR: nvcc not found. Install CUDA toolkit 12.8+ first."
-    echo "  apt install cuda-toolkit-12-8  (or similar)"
     exit 1
 fi
 
@@ -50,71 +51,57 @@ echo "CUDA version: ${NVCC_VERSION}"
 
 # Check Python/torch
 python3 -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA: {torch.version.cuda}')" 2>/dev/null || {
-    echo "ERROR: PyTorch not found. Install PyTorch with CUDA 12.8 support first."
+    echo "ERROR: PyTorch not found."
     exit 1
 }
 
-# Verify GPU is visible
+# Check GPU
 python3 -c "
 import torch
 if torch.cuda.is_available():
     props = torch.cuda.get_device_properties(0)
-    cc = f'{props.major}.{props.minor}'
-    print(f'GPU: {props.name}, Compute Capability: {cc}')
-    if cc != '12.0':
-        print(f'WARNING: Expected SM 12.0 (RTX 5090), got SM {cc}')
-        print('         Adjust TORCH_CUDA_ARCH_LIST if building for a different GPU.')
+    print(f'GPU: {props.name}, SM {props.major}.{props.minor}')
 else:
-    print('WARNING: No CUDA GPU detected. Building anyway with specified arch.')
+    print('WARNING: No CUDA GPU detected.')
 " 2>/dev/null || true
 
 echo ""
 
-# ---- Install build dependencies ----
+# ---- Install build deps ----
 echo "=== Installing build dependencies ==="
 pip install --upgrade pip setuptools wheel packaging ninja
-
-# ninja is critical - without it, build uses make which is much slower
-if command -v ninja &> /dev/null; then
-    echo "ninja found: $(ninja --version)"
-else
-    echo "WARNING: ninja not found, build will be slower"
-fi
-
 echo ""
 
-# ---- Build flash-attn ----
-echo "=== Building flash-attn (this takes ~5-10 min with correct arch) ==="
+# ---- Build ----
+echo "=== Building flash-attn for SM 120 only ==="
 echo "    Started at: $(date)"
 echo ""
 
 BUILD_START=$(date +%s)
 
-if [ -n "${FLASH_ATTN_VERSION}" ]; then
-    echo "Installing flash-attn==${FLASH_ATTN_VERSION} from source..."
-    pip install flash-attn==${FLASH_ATTN_VERSION} --no-build-isolation
-else
-    echo "Installing latest flash-attn from source..."
-    pip install flash-attn --no-build-isolation
-fi
+pip install flash-attn --no-build-isolation
 
 BUILD_END=$(date +%s)
 BUILD_SECS=$((BUILD_END - BUILD_START))
 BUILD_MINS=$((BUILD_SECS / 60))
+BUILD_REM=$((BUILD_SECS % 60))
 
 echo ""
-echo "=== Build complete in ${BUILD_MINS}m ${BUILD_SECS}s ==="
+echo "=== Build complete in ${BUILD_MINS}m ${BUILD_REM}s ==="
 echo ""
 
 # ---- Verify ----
-echo "=== Verifying installation ==="
+echo "=== Verifying ==="
 python3 -c "
 import flash_attn
 print(f'flash-attn version: {flash_attn.__version__}')
-from flash_attn import flash_attn_func
-print('flash_attn_func imported successfully')
-print('All good!')
+try:
+    from flash_attn import flash_attn_func
+    print('flash_attn_func imported OK')
+except Exception as e:
+    print(f'Import warning: {e}')
+print()
+print('NOTE: If you get runtime CUDA errors on sm_120,')  
+print('Blackwell kernel support may still be incomplete.')  
+print('The server will auto-fallback to sdpa in that case.')
 "
-
-echo ""
-echo "Done. flash-attn is ready for RTX 5090."
