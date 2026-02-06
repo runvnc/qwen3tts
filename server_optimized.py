@@ -175,9 +175,9 @@ class Qwen3TTSServer:
             self.model.enable_streaming_optimizations(
                 decode_window_frames=DEFAULT_DECODE_WINDOW,
                 use_compile=True,
-                use_cuda_graphs=True,  # Enable for better TTFT
+                use_cuda_graphs=True,
                 compile_mode="reduce-overhead",
-                use_fast_codebook=False,  # Disabled in fork too
+                use_fast_codebook=False,
                 compile_codebook_predictor=True,
             )
             logger.info(f"Optimizations enabled in {time.time() - start:.2f}s")
@@ -365,7 +365,7 @@ class Qwen3TTSServer:
             chunk_count = 0
             total_bytes = 0
             first_chunk_time = None
-            pcm_sr = 24000  # Will be updated from first chunk
+            pcm_sr = 24000
             t_start = time.time()
             chunk_index = 0
 
@@ -388,16 +388,12 @@ class Qwen3TTSServer:
                     profile.mark("first_audio_chunk")
                     logger.info(f"First chunk at {first_chunk_time*1000:.0f}ms")
 
-                # Update sample rate from chunk
                 pcm_sr = sr
                 
-                # Audio processing pipeline:
-                # 1) Repair clicks at chunk boundaries (interpolation)
+                # Audio processing pipeline
                 pcm_chunk = click_repair.process(pcm_chunk)
-                # 2) Anti-aliasing LPF (streaming, maintains state across chunks)
                 pcm_chunk = aa_filter.process(pcm_chunk)
 
-                # Convert to ulaw and send immediately
                 ulaw_bytes = resampler.process(pcm_chunk)
                 ulaw_chunks = chunk_audio(ulaw_bytes, 160)
                 
@@ -429,12 +425,19 @@ class Qwen3TTSServer:
             await websocket.send(json.dumps({"type": "error", "message": str(e)}))
 
     async def handle_connection(self, websocket: WebSocketServerProtocol):
-        """Handle a WebSocket connection."""
+        """Handle a WebSocket connection with concurrent message reading.
+        
+        Uses a message queue so that cancel and new generate_stream requests
+        can be processed even while a generation is in progress.
+        """
         session_id = str(id(websocket))
         session = VoiceSession()
         self.sessions[session_id] = session
 
         logger.info(f"New connection: {session_id}")
+
+        # Track current generation task
+        gen_task: Optional[asyncio.Task] = None
 
         try:
             await websocket.send(json.dumps({
@@ -452,11 +455,46 @@ class Qwen3TTSServer:
                     msg_type = data.get("type", "")
 
                     if msg_type == "init":
+                        # Wait for any active generation to finish first
+                        if gen_task and not gen_task.done():
+                            session.cancel_requested = True
+                            logger.info("Cancelling active generation for init")
+                            try:
+                                await asyncio.wait_for(gen_task, timeout=5.0)
+                            except asyncio.TimeoutError:
+                                gen_task.cancel()
+                                try:
+                                    await gen_task
+                                except asyncio.CancelledError:
+                                    pass
+                            gen_task = None
                         await self.handle_init(websocket, session, data)
+
                     elif msg_type == "generate_stream":
-                        await self.handle_generate_stream(websocket, session, data)
+                        # Cancel any active generation before starting new one
+                        if gen_task and not gen_task.done():
+                            session.cancel_requested = True
+                            logger.info("Cancelling active generation for new request")
+                            try:
+                                await asyncio.wait_for(gen_task, timeout=5.0)
+                            except asyncio.TimeoutError:
+                                logger.warning("Generation task didn't stop in time, force cancelling")
+                                gen_task.cancel()
+                                try:
+                                    await gen_task
+                                except asyncio.CancelledError:
+                                    pass
+                            gen_task = None
+                        
+                        # Run generation as a task so message loop continues
+                        gen_task = asyncio.create_task(
+                            self.handle_generate_stream(websocket, session, data)
+                        )
+
                     elif msg_type == "cancel":
                         session.cancel_requested = True
+                        logger.info("Cancel requested")
+
                     elif msg_type == "ping":
                         await websocket.send(json.dumps({"type": "pong"}))
 
@@ -466,6 +504,14 @@ class Qwen3TTSServer:
         except websockets.exceptions.ConnectionClosed as e:
             logger.info(f"Connection closed: {session_id} ({e})")
         finally:
+            # Clean up any running generation
+            if gen_task and not gen_task.done():
+                session.cancel_requested = True
+                gen_task.cancel()
+                try:
+                    await gen_task
+                except asyncio.CancelledError:
+                    pass
             del self.sessions[session_id]
 
     async def run(self):
