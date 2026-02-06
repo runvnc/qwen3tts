@@ -478,8 +478,8 @@ class Qwen3TTSServer:
             self.host,
             self.port,
             max_size=50 * 1024 * 1024,
-            ping_interval=20,
-            ping_timeout=20,
+            ping_interval=30,
+            ping_timeout=120,
         ):
             await asyncio.Future()
 
