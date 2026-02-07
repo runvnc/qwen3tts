@@ -15,12 +15,6 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
-import torch._dynamo
-# Increase dynamo cache size limit - with limit=8, dynamo gives up too early
-# and falls back to eager mode which is too slow on 4090.
-# Higher limit = more compilations during warmup, but faster steady-state.
-torch._dynamo.config.cache_size_limit = 9
-
 # Enable TensorFloat32 for better performance on Ampere+ GPUs
 torch.set_float32_matmul_precision('high')
 
@@ -481,11 +475,20 @@ class Qwen3TTSServer:
                         await self.handle_init(websocket, session, data)
 
                     elif msg_type == "generate_stream":
-                        # If a generation is already running, ignore new requests
-                        # (prevents cancel-during-compilation from corrupting state)
+                        # Cancel any active generation before starting new one
                         if gen_task and not gen_task.done():
-                            logger.info("Generation already in progress, ignoring new request")
-                            continue
+                            session.cancel_requested = True
+                            logger.info("Cancelling active generation for new request")
+                            try:
+                                await asyncio.wait_for(gen_task, timeout=0.5)
+                            except asyncio.TimeoutError:
+                                logger.warning("Generation task didn't stop in 0.5s, force cancelling")
+                                gen_task.cancel()
+                                try:
+                                    await gen_task
+                                except asyncio.CancelledError:
+                                    pass
+                            gen_task = None
                         
                         # Run generation as a task so message loop continues
                         gen_task = asyncio.create_task(
