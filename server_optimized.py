@@ -15,6 +15,12 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
+import torch._dynamo
+# Increase dynamo cache size limit - with limit=8, dynamo gives up too early
+# and falls back to eager mode which is too slow on 4090.
+# Higher limit = more compilations during warmup, but faster steady-state.
+torch._dynamo.config.cache_size_limit = 9
+
 # Enable TensorFloat32 for better performance on Ampere+ GPUs
 torch.set_float32_matmul_precision('high')
 
