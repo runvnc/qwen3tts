@@ -7,7 +7,6 @@ Requires: pip install -e /path/to/Qwen3-TTS-streaming
 """
 
 import asyncio
-import torch._dynamo
 import json
 import logging
 import os
@@ -16,6 +15,13 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
+import torch._dynamo
+
+# Tell dynamo to use dynamic shapes instead of recompiling for each new tensor size.
+# Without this, the talker's autoregressive loop triggers recompilation every step
+# (kv_length changes), wasting 30-40s on the first generation.
+torch._dynamo.config.automatic_dynamic_shapes = True
+torch._dynamo.config.assume_static_by_default = False
 
 # Enable TensorFloat32 for better performance on Ampere+ GPUs
 torch.set_float32_matmul_precision('high')
