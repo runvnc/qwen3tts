@@ -59,6 +59,7 @@ DEFAULT_EMIT_EVERY = int(os.environ.get('QWEN3_EMIT_EVERY', '2'))
 DEFAULT_DECODE_WINDOW = int(os.environ.get('QWEN3_DECODE_WINDOW', '80'))
 # Click repair threshold (amplitude jump that triggers interpolation)
 DEFAULT_CLICK_THRESHOLD = float(os.environ.get('QWEN3_CLICK_THRESHOLD', '0.15'))
+DEFAULT_OVERLAP_SAMPLES = int(os.environ.get('QWEN3_OVERLAP_SAMPLES', '1024'))
 
 # Try to import qwen_tts (should be the fork)
 try:
@@ -119,7 +120,7 @@ class Qwen3TTSServer:
         self.sessions: Dict[str, VoiceSession] = {}
         self.voice_cache = VoiceCache(max_voices=50)
         
-        logger.info(f"Server config: emit_every={DEFAULT_EMIT_EVERY}, decode_window={DEFAULT_DECODE_WINDOW}, click_threshold={DEFAULT_CLICK_THRESHOLD}")
+        logger.info(f"Server config: emit_every={DEFAULT_EMIT_EVERY}, decode_window={DEFAULT_DECODE_WINDOW}, click_threshold={DEFAULT_CLICK_THRESHOLD}, overlap_samples={DEFAULT_OVERLAP_SAMPLES}")
 
     def _get_torch_dtype(self) -> torch.dtype:
         dtype_map = {
@@ -376,7 +377,7 @@ class Qwen3TTSServer:
                 voice_clone_prompt=session.voice_prompt,
                 emit_every_frames=emit_every,
                 decode_window_frames=decode_window,
-                overlap_samples=512,
+                overlap_samples=DEFAULT_OVERLAP_SAMPLES,
             )
             async for pcm_chunk, sr in async_iter_sync_gen(sync_gen):
                 if session.cancel_requested:
