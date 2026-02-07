@@ -1,6 +1,4 @@
 #!/usr/bin/env python3
-import os
-os.environ['TORCHDYNAMO_DISABLE'] = '1'  # Disable dynamo entirely - prevents recompilation stalls
 """
 Qwen3-TTS WebSocket Streaming Server - Optimized Version
 
@@ -185,6 +183,20 @@ class Qwen3TTSServer:
             logger.info(f"Optimizations enabled in {time.time() - start:.2f}s")
         else:
             logger.warning("enable_streaming_optimizations not available - using standard qwen_tts?")
+
+        # Monkey-patch transformers masking functions to prevent dynamo recompilation.
+        # These functions get called with different KV lengths every autoregressive step,
+        # causing dynamo to recompile (30-60s overhead). Disabling dynamo on them specifically
+        # keeps the decoder/code_predictor compiled while avoiding the recompilation storm.
+        try:
+            import torch._dynamo
+            import transformers.masking_utils as _mu
+            for _fn_name in ('create_causal_mask', 'sdpa_mask_older_torch'):
+                if hasattr(_mu, _fn_name):
+                    setattr(_mu, _fn_name, torch._dynamo.disable(getattr(_mu, _fn_name)))
+                    logger.info(f"Disabled dynamo on transformers.masking_utils.{_fn_name}")
+        except ImportError:
+            logger.info("transformers.masking_utils not found, skipping dynamo patches")
 
 
 
