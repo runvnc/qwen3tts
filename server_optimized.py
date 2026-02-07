@@ -475,20 +475,11 @@ class Qwen3TTSServer:
                         await self.handle_init(websocket, session, data)
 
                     elif msg_type == "generate_stream":
-                        # Cancel any active generation before starting new one
+                        # If a generation is already running, ignore new requests
+                        # (prevents cancel-during-compilation from corrupting state)
                         if gen_task and not gen_task.done():
-                            session.cancel_requested = True
-                            logger.info("Cancelling active generation for new request")
-                            try:
-                                await asyncio.wait_for(gen_task, timeout=5.0)
-                            except asyncio.TimeoutError:
-                                logger.warning("Generation task didn't stop in time, force cancelling")
-                                gen_task.cancel()
-                                try:
-                                    await gen_task
-                                except asyncio.CancelledError:
-                                    pass
-                            gen_task = None
+                            logger.info("Generation already in progress, ignoring new request")
+                            continue
                         
                         # Run generation as a task so message loop continues
                         gen_task = asyncio.create_task(
