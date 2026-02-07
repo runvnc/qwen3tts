@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+import os
+os.environ['TORCHDYNAMO_DISABLE'] = '1'  # Disable dynamo entirely - prevents recompilation stalls
 """
 Qwen3-TTS WebSocket Streaming Server - Optimized Version
 
@@ -15,14 +17,6 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
-import torch._dynamo
-
-# Tell dynamo to use dynamic shapes instead of recompiling for each new tensor size.
-# Without this, the talker's autoregressive loop triggers recompilation every step
-# (kv_length changes), wasting 30-40s on the first generation.
-torch._dynamo.config.automatic_dynamic_shapes = True
-torch._dynamo.config.assume_static_by_default = False
-
 # Enable TensorFloat32 for better performance on Ampere+ GPUs
 torch.set_float32_matmul_precision('high')
 
@@ -192,11 +186,7 @@ class Qwen3TTSServer:
         else:
             logger.warning("enable_streaming_optimizations not available - using standard qwen_tts?")
 
-        # Prevent dynamo from tracing the talker's autoregressive loop
-        # (shapes change every step, causing pointless recompilations)
-        if self.model and hasattr(self.model, 'model') and hasattr(self.model.model, 'talker'):
-            self.model.model.talker.forward = torch._dynamo.disable(self.model.model.talker.forward)
-            logger.info("Disabled dynamo on talker (prevents shape-triggered recompilation)")
+
 
     async def handle_init(
         self,
