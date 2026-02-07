@@ -7,6 +7,7 @@ Requires: pip install -e /path/to/Qwen3-TTS-streaming
 """
 
 import asyncio
+import torch._dynamo
 import json
 import logging
 import os
@@ -184,6 +185,12 @@ class Qwen3TTSServer:
             logger.info(f"Optimizations enabled in {time.time() - start:.2f}s")
         else:
             logger.warning("enable_streaming_optimizations not available - using standard qwen_tts?")
+
+        # Prevent dynamo from tracing the talker's autoregressive loop
+        # (shapes change every step, causing pointless recompilations)
+        if self.model and hasattr(self.model, 'model') and hasattr(self.model.model, 'talker'):
+            self.model.model.talker.forward = torch._dynamo.disable(self.model.model.talker.forward)
+            logger.info("Disabled dynamo on talker (prevents shape-triggered recompilation)")
 
     async def handle_init(
         self,
